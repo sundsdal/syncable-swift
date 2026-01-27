@@ -9,6 +9,7 @@ struct TestItem: SyncableProtocol {
     var userId: UUID?
     var updatedAt: Date
     var deleted: Bool
+    var syncedAt: Date?
     var title: String
 
     init(
@@ -16,12 +17,14 @@ struct TestItem: SyncableProtocol {
         userId: UUID? = UUID(),
         updatedAt: Date = Date(),
         deleted: Bool = false,
+        syncedAt: Date? = nil,
         title: String = "Test"
     ) {
         self.id = id
         self.userId = userId
         self.updatedAt = updatedAt
         self.deleted = deleted
+        self.syncedAt = syncedAt
         self.title = title
     }
 }
@@ -35,6 +38,7 @@ func makeTestDatabase() throws -> DatabaseQueue {
             t.column("userId", .text)
             t.column("updatedAt", .datetime).notNull()
             t.column("deleted", .boolean).notNull().defaults(to: false)
+            t.column("syncedAt", .datetime)
             t.column("title", .text).notNull()
         }
     }
@@ -214,27 +218,87 @@ struct SyncableRegistrationTests {
         #expect(decoded?.title == "Decode Test")
     }
 
-    @Test("Registration fetchUpdatedSince filters correctly")
-    func fetchUpdatedSince() throws {
+    @Test("Registration fetchDirty finds unsynced items")
+    func fetchDirtyFindsUnsynced() throws {
         let dbQueue = try makeTestDatabase()
         let registration = SyncableRegistration.create(TestItem.self)
         let userId = UUID()
 
-        let cutoffDate = Date()
-        let oldItem = TestItem(userId: userId, updatedAt: cutoffDate.addingTimeInterval(-100), title: "Old")
-        let newItem = TestItem(userId: userId, updatedAt: cutoffDate.addingTimeInterval(100), title: "New")
+        // Item with no syncedAt (dirty)
+        let unsyncedItem = TestItem(userId: userId, updatedAt: Date(), syncedAt: nil, title: "Unsynced")
+        // Item with syncedAt = updatedAt (clean)
+        let syncedItem = TestItem(userId: userId, updatedAt: Date(), syncedAt: Date(), title: "Synced")
 
         try dbQueue.write { db in
-            try oldItem.insert(db)
-            try newItem.insert(db)
+            try unsyncedItem.insert(db)
+            try syncedItem.insert(db)
         }
 
-        let updated = try dbQueue.read { db in
-            try registration.fetchUpdatedSince(db, cutoffDate, userId)
+        let dirty = try dbQueue.read { db in
+            try registration.fetchDirty(db, userId, 100)
         }
 
-        #expect(updated.count == 1)
-        #expect((updated.first as? TestItem)?.title == "New")
+        #expect(dirty.count == 1)
+        #expect((dirty.first as? TestItem)?.title == "Unsynced")
+    }
+
+    @Test("Registration fetchDirty finds modified items")
+    func fetchDirtyFindsModified() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+        let userId = UUID()
+
+        let syncTime = Date()
+        // Item modified after sync (dirty)
+        let modifiedItem = TestItem(userId: userId, updatedAt: syncTime.addingTimeInterval(100), syncedAt: syncTime, title: "Modified")
+        // Item not modified since sync (clean)
+        let cleanItem = TestItem(userId: userId, updatedAt: syncTime, syncedAt: syncTime, title: "Clean")
+
+        try dbQueue.write { db in
+            try modifiedItem.insert(db)
+            try cleanItem.insert(db)
+        }
+
+        let dirty = try dbQueue.read { db in
+            try registration.fetchDirty(db, userId, 100)
+        }
+
+        #expect(dirty.count == 1)
+        #expect((dirty.first as? TestItem)?.title == "Modified")
+    }
+
+    @Test("Registration markAsSynced updates syncedAt")
+    func markAsSyncedWorks() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+
+        let item = TestItem(updatedAt: Date(), syncedAt: nil, title: "Test")
+        try dbQueue.write { db in
+            try item.insert(db)
+        }
+
+        // Verify item is dirty before
+        let dirtyBefore = try dbQueue.read { db in
+            try registration.fetchDirty(db, nil, 100)
+        }
+        #expect(dirtyBefore.count == 1)
+
+        // Mark as synced
+        try dbQueue.write { db in
+            try registration.markAsSynced([item.id], db)
+        }
+
+        // Verify item is no longer dirty
+        let dirtyAfter = try dbQueue.read { db in
+            try registration.fetchDirty(db, nil, 100)
+        }
+        #expect(dirtyAfter.count == 0)
+
+        // Verify syncedAt was set
+        let fetched = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: item.id)
+        }
+        #expect(fetched?.syncedAt == fetched?.updatedAt)
     }
 
     @Test("Registration upsertIfNewer applies LWW")
@@ -270,5 +334,17 @@ struct SyncableRegistrationTests {
             try TestItem.fetchOne(db, key: id)
         }
         #expect(finalResult?.title == "Newer") // Still "Newer", not "Older"
+    }
+
+    @Test("Registration encode excludes syncedAt")
+    func encodeExcludesSyncedAt() throws {
+        let registration = SyncableRegistration.create(TestItem.self)
+        let item = TestItem(syncedAt: Date(), title: "Test")
+
+        let data = try registration.encode(item)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+
+        #expect(json?["title"] as? String == "Test")
+        #expect(json?["syncedAt"] == nil) // Should be excluded
     }
 }

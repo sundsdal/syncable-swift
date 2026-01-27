@@ -187,12 +187,10 @@ public final class SyncManager: @unchecked Sendable {
         guard let currentUserId = userId else { return }
 
         let tableName = registration.tableName
-        let lastPushKey = "lastPush_\(tableName)"
-        let lastPushed = await timestampStorage.getLastSyncTimestamp(for: lastPushKey)
 
-        // Fetch dirty items (updated since last push)
+        // Fetch dirty items using per-row tracking (syncedAt is nil OR updatedAt > syncedAt)
         let dirtyItems: [any SyncableProtocol] = try await dbWriter.read { db in
-            try registration.fetchUpdatedSince(db, lastPushed, currentUserId)
+            try registration.fetchDirty(db, currentUserId, maxRows)
         }
 
         guard !dirtyItems.isEmpty else { return }
@@ -208,17 +206,16 @@ public final class SyncManager: @unchecked Sendable {
             jsonArray.append(json)
         }
 
-        // Batch upsert to Supabase in chunks to avoid payload size limits
-        for batch in jsonArray.chunked(into: maxRows) {
-            try await supabaseClient
-                .from(tableName)
-                .upsert(batch)
-                .execute()
-        }
+        // Upsert to Supabase
+        try await supabaseClient
+            .from(tableName)
+            .upsert(jsonArray)
+            .execute()
 
-        // Update last pushed timestamp
-        if let maxUpdatedAt = dirtyItems.map(\.updatedAt).max() {
-            await timestampStorage.setLastSyncTimestamp(maxUpdatedAt, for: lastPushKey)
+        // Mark successfully synced items (per-row tracking prevents data loss)
+        let syncedIds = dirtyItems.map(\.id)
+        try await dbWriter.write { db in
+            try registration.markAsSynced(syncedIds, db)
         }
     }
 
@@ -227,20 +224,32 @@ public final class SyncManager: @unchecked Sendable {
 
         let tableName = registration.tableName
         let lastPullKey = "lastPull_\(tableName)"
-        let lastPulled = await timestampStorage.getLastSyncTimestamp(for: lastPullKey)
+        let lastPullIdKey = "lastPullId_\(tableName)"
 
-        // Fetch from Supabase
+        // Key-set pagination state
+        let lastPulledTime = await timestampStorage.getLastSyncTimestamp(for: lastPullKey)
+        let lastPulledIdString = UserDefaults.standard.string(forKey: lastPullIdKey)
+        let lastPulledId = lastPulledIdString.flatMap { UUID(uuidString: $0) }
+
+        // Build query with key-set pagination to avoid missing records at timestamp boundaries
+        // Filter: (updated_at > lastPulled) OR (updated_at = lastPulled AND id > lastPulledId)
         var query = supabaseClient
             .from(tableName)
             .select()
             .eq("user_id", value: currentUserId.uuidString)
 
-        if let lastPulled {
-            query = query.gt("updated_at", value: lastPulled.iso8601String)
+        if let lastPulledTime {
+            if let lastPulledId {
+                // Key-set pagination: get records after the cursor (time, id)
+                query = query.or("updated_at.gt.\(lastPulledTime.iso8601String),and(updated_at.eq.\(lastPulledTime.iso8601String),id.gt.\(lastPulledId.uuidString))")
+            } else {
+                query = query.gt("updated_at", value: lastPulledTime.iso8601String)
+            }
         }
 
         let response = try await query
             .order("updated_at", ascending: true)
+            .order("id", ascending: true)
             .limit(maxRows)
             .execute()
 
@@ -251,30 +260,29 @@ public final class SyncManager: @unchecked Sendable {
             throw SyncError.decodingFailed("Failed to parse JSON array from Supabase response")
         }
 
-        // Process items and track max updated date
-        var itemsToUpsert: [(any SyncableProtocol, Data)] = []
-        var maxUpdatedAt: Date?
+        // Process items and track cursor for key-set pagination
+        var itemsToUpsert: [any SyncableProtocol] = []
+        var lastItem: (any SyncableProtocol)?
 
         for jsonObject in jsonArray {
             let itemData = try JSONSerialization.data(withJSONObject: jsonObject)
             let item = try registration.decode(itemData)
-            itemsToUpsert.append((item, itemData))
-
-            if maxUpdatedAt.map({ item.updatedAt > $0 }) ?? true {
-                maxUpdatedAt = item.updatedAt
-            }
+            itemsToUpsert.append(item)
+            lastItem = item
         }
 
         // Upsert all items in a single write transaction
+        let items = itemsToUpsert // Capture for closure
         try await dbWriter.write { db in
-            for (item, _) in itemsToUpsert {
+            for item in items {
                 try registration.upsertIfNewer(item, db)
             }
         }
 
-        // Update last pulled timestamp
-        if let maxUpdatedAt {
-            await timestampStorage.setLastSyncTimestamp(maxUpdatedAt, for: lastPullKey)
+        // Update key-set pagination cursor
+        if let lastItem {
+            await timestampStorage.setLastSyncTimestamp(lastItem.updatedAt, for: lastPullKey)
+            UserDefaults.standard.set(lastItem.id.uuidString, forKey: lastPullIdKey)
         }
     }
 

@@ -15,22 +15,22 @@ public struct SyncableRegistration: Sendable {
     /// Fetch all records for a user from the database
     let fetchAll: @Sendable (Database, UUID?) throws -> [any SyncableProtocol]
 
-    /// Fetch records updated after a given timestamp
-    let fetchUpdatedSince: @Sendable (Database, Date?, UUID?) throws -> [any SyncableProtocol]
+    /// Fetch dirty records that need to be pushed (syncedAt is nil OR updatedAt > syncedAt)
+    let fetchDirty: @Sendable (Database, UUID?, Int) throws -> [any SyncableProtocol]
+
+    /// Mark specific record IDs as synced (set syncedAt = updatedAt)
+    let markAsSynced: @Sendable ([UUID], Database) throws -> Void
 
     /// Upsert a record into the database (LWW: only if newer)
     let upsertIfNewer: @Sendable (any SyncableProtocol, Database) throws -> Void
 
-    /// Encode a record to JSON data for Supabase upload
+    /// Encode a record to JSON data for Supabase upload (excludes syncedAt)
     let encode: @Sendable (any SyncableProtocol) throws -> Data
 
     /// Create a registration for a specific Syncable type
     public static func create<T: SyncableProtocol>(_ type: T.Type) -> SyncableRegistration {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
 
         return SyncableRegistration(
             tableName: T.databaseTableName,
@@ -44,15 +44,26 @@ public struct SyncableRegistration: Sendable {
                     return try T.fetchAll(db)
                 }
             },
-            fetchUpdatedSince: { db, timestamp, userId in
-                var query = T.all()
+            fetchDirty: { db, userId, limit in
+                // Dirty = syncedAt is NULL OR updatedAt > syncedAt
+                var query = T.filter(
+                    SyncableColumns.syncedAt == nil ||
+                    SyncableColumns.updatedAt > SyncableColumns.syncedAt
+                )
                 if let userId {
                     query = query.filter(SyncableColumns.userId == userId)
                 }
-                if let timestamp {
-                    query = query.filter(SyncableColumns.updatedAt > timestamp)
+                return try query.limit(limit).fetchAll(db)
+            },
+            markAsSynced: { ids, db in
+                guard !ids.isEmpty else { return }
+                // Update syncedAt = updatedAt for these specific IDs
+                for id in ids {
+                    if var record = try T.fetchOne(db, key: id) {
+                        record.syncedAt = record.updatedAt
+                        try record.update(db)
+                    }
                 }
-                return try query.fetchAll(db)
             },
             upsertIfNewer: { record, db in
                 guard let typedRecord = record as? T else {
@@ -62,7 +73,10 @@ public struct SyncableRegistration: Sendable {
                 // LWW: Check if existing record and only update if incoming is newer
                 if let existing = try T.fetchOne(db, key: typedRecord.id) {
                     if typedRecord.updatedAt > existing.updatedAt {
-                        try typedRecord.update(db)
+                        // Preserve local syncedAt when updating from remote
+                        var updated = typedRecord
+                        updated.syncedAt = existing.syncedAt
+                        try updated.update(db)
                     }
                     // else: existing is newer, ignore incoming
                 } else {
@@ -73,7 +87,16 @@ public struct SyncableRegistration: Sendable {
                 guard let typedRecord = record as? T else {
                     throw SyncableRegistrationError.typeMismatch
                 }
-                return try encoder.encode(typedRecord)
+                // Encode to dictionary, remove syncedAt (local-only), then re-encode
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                let data = try encoder.encode(typedRecord)
+                guard var dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw SyncableRegistrationError.encodingFailed
+                }
+                // Remove local-only field before sending to backend
+                dict.removeValue(forKey: "syncedAt")
+                return try JSONSerialization.data(withJSONObject: dict)
             }
         )
     }
@@ -82,11 +105,14 @@ public struct SyncableRegistration: Sendable {
 /// Errors that can occur during registration operations
 public enum SyncableRegistrationError: Error, LocalizedError {
     case typeMismatch
+    case encodingFailed
 
     public var errorDescription: String? {
         switch self {
         case .typeMismatch:
             return "Type mismatch in SyncableRegistration"
+        case .encodingFailed:
+            return "Failed to encode record for sync"
         }
     }
 }

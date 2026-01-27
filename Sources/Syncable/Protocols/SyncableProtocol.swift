@@ -13,11 +13,12 @@ import GRDB
 ///     var userId: UUID?
 ///     var updatedAt: Date
 ///     var deleted: Bool
+///     var syncedAt: Date?  // Local-only, tracks last successful sync
 ///     var title: String
 ///
 ///     // GRDB column mapping
 ///     enum Columns: String, ColumnExpression {
-///         case id, userId, updatedAt, deleted, title
+///         case id, userId, updatedAt, deleted, syncedAt, title
 ///     }
 /// }
 /// ```
@@ -42,6 +43,11 @@ public protocol SyncableProtocol: Codable, FetchableRecord, PersistableRecord, I
     /// Soft delete flag - records are never hard deleted during sync
     var deleted: Bool { get set }
 
+    /// Timestamp when this record was last successfully synced to backend (local-only field)
+    /// A record is "dirty" if syncedAt is nil OR updatedAt > syncedAt
+    /// This field should NOT be included in Supabase table schema - it's client-side only
+    var syncedAt: Date? { get set }
+
     /// The name of the database table (and Supabase table) for this model
     static var databaseTableName: String { get }
 }
@@ -61,4 +67,5 @@ public enum SyncableColumns: String, ColumnExpression {
     case userId
     case updatedAt
     case deleted
+    case syncedAt
 }

@@ -162,28 +162,7 @@ struct SyncErrorTests {
 
 // MARK: - Test Helpers
 
-/// Standalone backoff helper for testing (can be used in future implementations)
-struct ExponentialBackoff {
-    var currentDelay: TimeInterval = 1.0
-    let maxDelay: TimeInterval
-
-    init(maxDelay: TimeInterval = 60.0) {
-        self.maxDelay = maxDelay
-    }
-
-    @discardableResult
-    mutating func recordFailure() -> TimeInterval {
-        let delay = currentDelay
-        currentDelay = min(currentDelay * 2, maxDelay)
-        return delay
-    }
-
-    mutating func recordSuccess() {
-        currentDelay = 1.0
-    }
-}
-
-/// Standalone echo cache helper for testing (can be used in future implementations)
+/// Test helper echo cache (for testing purposes - not used in production yet)
 struct EchoPreventionCache {
     private var cache: [UUID: Date] = [:]
     let ttl: TimeInterval
@@ -206,60 +185,6 @@ struct EchoPreventionCache {
     mutating func purgeExpired() {
         let cutoff = Date().addingTimeInterval(-ttl)
         cache = cache.filter { $0.value > cutoff }
-    }
-}
-
-@Suite("Backoff Tests")
-struct BackoffTests {
-
-    @Test("Initial backoff is 1 second")
-    func initialBackoff() {
-        let backoff = ExponentialBackoff()
-        #expect(backoff.currentDelay == 1.0)
-    }
-
-    @Test("Backoff doubles on failure")
-    func backoffDoubles() {
-        var backoff = ExponentialBackoff()
-
-        let first = backoff.recordFailure()
-        #expect(first == 1.0)
-        #expect(backoff.currentDelay == 2.0)
-
-        let second = backoff.recordFailure()
-        #expect(second == 2.0)
-        #expect(backoff.currentDelay == 4.0)
-
-        let third = backoff.recordFailure()
-        #expect(third == 4.0)
-        #expect(backoff.currentDelay == 8.0)
-    }
-
-    @Test("Backoff caps at maximum")
-    func backoffCapsAtMax() {
-        var backoff = ExponentialBackoff(maxDelay: 60.0)
-
-        for _ in 0..<10 {
-            _ = backoff.recordFailure()
-        }
-
-        #expect(backoff.currentDelay == 60.0)
-
-        _ = backoff.recordFailure()
-        #expect(backoff.currentDelay == 60.0)
-    }
-
-    @Test("Backoff resets on success")
-    func backoffResetsOnSuccess() {
-        var backoff = ExponentialBackoff()
-
-        _ = backoff.recordFailure()
-        _ = backoff.recordFailure()
-        _ = backoff.recordFailure()
-        #expect(backoff.currentDelay == 8.0)
-
-        backoff.recordSuccess()
-        #expect(backoff.currentDelay == 1.0)
     }
 }
 

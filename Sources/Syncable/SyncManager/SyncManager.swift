@@ -33,7 +33,9 @@ import Supabase
 ///
 /// ## Thread Safety
 /// This class is marked `@unchecked Sendable` because thread safety is manually managed via `NSLock`.
-/// All mutable state (`_userId`, `_syncingEnabled`, `_syncStatus`, `registrations`) is protected by `lock`.
+/// All mutable state is protected by `lock`:
+/// - Core state: `_userId`, `_syncingEnabled`, `_syncStatus`, `_lastSyncTime`, `_onStatusChange`, `registrations`
+/// - Sync loop state: `_syncInterval`, `_backoff`, `syncLoopTask`, `networkMonitor`
 /// Maintainers must acquire `lock` before reading or writing any of these properties.
 public final class SyncManager: @unchecked Sendable {
     // MARK: - Dependencies
@@ -55,6 +57,13 @@ public final class SyncManager: @unchecked Sendable {
     private var _syncStatus: SyncStatus = .idle
     private var _lastSyncTime: Date?
     private var _onStatusChange: ((SyncStatus) -> Void)?
+
+    // MARK: - Sync Loop State (protected by lock)
+
+    private var _syncInterval: TimeInterval = 30.0
+    private var _backoff = ExponentialBackoff()
+    private var syncLoopTask: Task<Void, Never>?
+    private var networkMonitor: NetworkMonitor?
 
     // MARK: - Registrations
 
@@ -123,6 +132,69 @@ public final class SyncManager: @unchecked Sendable {
             return _onStatusChange
         }
         callback?(status)
+    }
+
+    /// The interval between automatic sync attempts in seconds
+    public var syncInterval: TimeInterval {
+        get { lock.withLock { _syncInterval } }
+        set { lock.withLock { _syncInterval = newValue } }
+    }
+
+    // MARK: - Sync Loop
+
+    /// Start the background sync loop with periodic sync attempts.
+    ///
+    /// The sync loop will:
+    /// - Sync immediately on start, then at the specified interval
+    /// - Automatically sync when network connectivity is restored
+    /// - Apply exponential backoff on failures (1s → 2s → 4s → ... → 60s max)
+    ///
+    /// - Parameter interval: Time between sync attempts in seconds (default: 30)
+    public func startSyncLoop(interval: TimeInterval = 30.0) {
+        stopSyncLoop()  // Cancel any existing loop first
+        lock.withLock { _syncInterval = interval }
+
+        // Start network monitor
+        let monitor = NetworkMonitor()
+        monitor.start { [weak self] in
+            Task { try? await self?.sync() }
+        }
+        lock.withLock { networkMonitor = monitor }
+
+        // Start periodic sync task
+        let task = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { break }
+
+                do {
+                    try await self.sync()
+                    self.lock.withLock { self._backoff.reset() }
+                } catch {
+                    // On failure, wait backoff delay then retry (no interval wait)
+                    let delay = self.lock.withLock { self._backoff.recordFailure() }
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    continue
+                }
+
+                guard !Task.isCancelled else { break }
+
+                // On success, wait interval before next sync
+                let interval = self.lock.withLock { self._syncInterval }
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            }
+        }
+        lock.withLock { syncLoopTask = task }
+    }
+
+    /// Stop the background sync loop
+    public func stopSyncLoop() {
+        lock.withLock {
+            syncLoopTask?.cancel()
+            syncLoopTask = nil
+            networkMonitor?.stop()
+            networkMonitor = nil
+            _backoff.reset()
+        }
     }
 
     // MARK: - Registration
@@ -290,6 +362,7 @@ public final class SyncManager: @unchecked Sendable {
 
     /// Clear all sync timestamps (call when user logs out)
     public func clearSyncState() async {
+        stopSyncLoop()
         await timestampStorage.clearAll()
 
         // Clear key-set pagination cursor IDs from UserDefaults

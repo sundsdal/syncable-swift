@@ -73,31 +73,54 @@
 - [x] `InMemorySyncTimestampStorage` tests
 - [x] `UserDefaultsSyncTimestampStorage` tests
 
+## Phase 5: Background Sync Loop ✅
+
+### 5.1 Exponential Backoff
+- [x] `ExponentialBackoff` struct with configurable initial/max delay
+- [x] `recordFailure()` returns delay and doubles internal state
+- [x] `reset()` returns to initial delay after success
+
+### 5.2 Network Monitoring
+- [x] `NetworkMonitor` using Network.framework
+- [x] Thread-safe `isConnected` property
+- [x] Callback when connectivity restored
+
+### 5.3 Sync Loop Integration
+- [x] `syncInterval` configurable property (default 30s)
+- [x] `startSyncLoop(interval:)` method
+- [x] `stopSyncLoop()` method
+- [x] Automatic sync on network restore
+- [x] Exponential backoff on failures (1s → 2s → 4s → ... → 60s max)
+- [x] `clearSyncState()` stops sync loop
+
+### 5.4 Testing
+- [x] `ExponentialBackoff` unit tests
+- [x] `NetworkMonitor` unit tests
+- [x] Sync loop lifecycle tests
+
 ---
 
 ## Future Work
-
-### Phase 5: Sync Loop
-- [ ] Background `Task` loop with configurable interval
-- [ ] Automatic sync on connectivity changes
-- [ ] Error handling with exponential backoff
 
 ### Phase 6: Realtime Subscriptions
 - [ ] Supabase Realtime integration
 - [ ] `RealtimeSubscriptionManager` (skeleton exists)
 - [ ] Conditional subscriptions based on multi-device activity
 
-### Phase 7: Optimizations
-- [ ] Echo prevention cache (avoid re-syncing own changes)
+### Phase 7: Echo Prevention
+- [ ] Echo prevention cache to avoid re-syncing own changes
+- [ ] TTL-based expiration for cache entries
+
+### Phase 8: Optimizations
 - [ ] `lastTimeOtherDeviceWasActive` logic
 - [ ] GRDB `ValueObservation` for reactive UI updates
 
-### Phase 8: Advanced Features
+### Phase 9: Advanced Features
 - [ ] Dead letter queue for failed items
 - [ ] Retry logic with configurable max attempts
 - [ ] Conflict resolution callbacks (custom merge strategies)
 
-### Phase 9: Documentation & Examples
+### Phase 10: Documentation & Examples
 - [ ] Example app with SwiftUI + GRDB + Syncable
 - [ ] "Getting Started" guide
 - [ ] "Offline First Best Practices" guide
@@ -118,6 +141,9 @@
 | SyncManager | ✅ |
 | Push sync (updatedAt > lastPushed) | ✅ |
 | Pull sync with LWW | ✅ |
-| Unit tests (35 passing) | ✅ |
+| ExponentialBackoff | ✅ |
+| NetworkMonitor | ✅ |
+| Background Sync Loop | ✅ |
+| Unit tests (48 passing) | ✅ |
 | technical_design.md | ✅ |
 | roadmap.md | ✅ |

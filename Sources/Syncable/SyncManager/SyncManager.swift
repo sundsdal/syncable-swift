@@ -56,6 +56,13 @@ public final class SyncManager: @unchecked Sendable {
     private var _lastSyncTime: Date?
     private var _onStatusChange: ((SyncStatus) -> Void)?
 
+    // MARK: - Sync Loop State (protected by lock)
+
+    private var _syncInterval: TimeInterval = 30.0
+    private var _backoff = ExponentialBackoff()
+    private var syncLoopTask: Task<Void, Never>?
+    private var networkMonitor: NetworkMonitor?
+
     // MARK: - Registrations
 
     private var registrations: [String: SyncableRegistration] = [:]
@@ -123,6 +130,64 @@ public final class SyncManager: @unchecked Sendable {
             return _onStatusChange
         }
         callback?(status)
+    }
+
+    /// The interval between automatic sync attempts in seconds
+    public var syncInterval: TimeInterval {
+        get { lock.withLock { _syncInterval } }
+        set { lock.withLock { _syncInterval = newValue } }
+    }
+
+    // MARK: - Sync Loop
+
+    /// Start the background sync loop with periodic sync attempts.
+    ///
+    /// The sync loop will:
+    /// - Sync at the specified interval
+    /// - Automatically sync when network connectivity is restored
+    /// - Apply exponential backoff on failures (1s → 2s → 4s → ... → 60s max)
+    ///
+    /// - Parameter interval: Time between sync attempts in seconds (default: 30)
+    public func startSyncLoop(interval: TimeInterval = 30.0) {
+        lock.withLock { _syncInterval = interval }
+
+        // Start network monitor
+        let monitor = NetworkMonitor()
+        monitor.start { [weak self] in
+            Task { try? await self?.sync() }
+        }
+        lock.withLock { networkMonitor = monitor }
+
+        // Start periodic sync task
+        syncLoopTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { break }
+
+                let interval = self.lock.withLock { self._syncInterval }
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+
+                guard !Task.isCancelled else { break }
+
+                do {
+                    try await self.sync()
+                    self.lock.withLock { self._backoff.reset() }
+                } catch {
+                    let delay = self.lock.withLock { self._backoff.recordFailure() }
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+            }
+        }
+    }
+
+    /// Stop the background sync loop
+    public func stopSyncLoop() {
+        syncLoopTask?.cancel()
+        syncLoopTask = nil
+        lock.withLock {
+            networkMonitor?.stop()
+            networkMonitor = nil
+            _backoff.reset()
+        }
     }
 
     // MARK: - Registration
@@ -290,6 +355,7 @@ public final class SyncManager: @unchecked Sendable {
 
     /// Clear all sync timestamps (call when user logs out)
     public func clearSyncState() async {
+        stopSyncLoop()
         await timestampStorage.clearAll()
 
         // Clear key-set pagination cursor IDs from UserDefaults

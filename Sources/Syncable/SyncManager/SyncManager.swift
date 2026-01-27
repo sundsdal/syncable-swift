@@ -158,6 +158,8 @@ public final class SyncManager: @unchecked Sendable {
         guard !dirtyItems.isEmpty else { return }
 
         // Encode items as array of AnyJSON for Supabase
+        // TODO: Optimize double encoding overhead - currently: Model -> Data -> AnyJSON -> Data
+        // Consider having registration return a type-erased Encodable wrapper instead
         var jsonArray: [AnyJSON] = []
         let decoder = JSONDecoder()
         for item in dirtyItems {
@@ -166,11 +168,13 @@ public final class SyncManager: @unchecked Sendable {
             jsonArray.append(json)
         }
 
-        // Batch upsert to Supabase
-        try await supabaseClient
-            .from(tableName)
-            .upsert(jsonArray)
-            .execute()
+        // Batch upsert to Supabase in chunks to avoid payload size limits
+        for batch in jsonArray.chunked(into: maxRows) {
+            try await supabaseClient
+                .from(tableName)
+                .upsert(batch)
+                .execute()
+        }
 
         // Update last pushed timestamp
         if let maxUpdatedAt = dirtyItems.map(\.updatedAt).max() {
@@ -216,7 +220,7 @@ public final class SyncManager: @unchecked Sendable {
             let item = try registration.decode(itemData)
             itemsToUpsert.append((item, itemData))
 
-            if maxUpdatedAt == nil || item.updatedAt > maxUpdatedAt! {
+            if maxUpdatedAt.map({ item.updatedAt > $0 }) ?? true {
                 maxUpdatedAt = item.updatedAt
             }
         }
@@ -265,6 +269,17 @@ public enum SyncError: Error, LocalizedError {
             return "Failed to decode from sync: \(message)"
         case .networkError(let error):
             return "Network error during sync: \(error.localizedDescription)"
+        }
+    }
+}
+
+// MARK: - Array Chunking Helper
+
+private extension Array {
+    /// Split array into chunks of specified size
+    func chunked(into size: Int) -> [[Element]] {
+        stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
         }
     }
 }

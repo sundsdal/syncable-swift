@@ -291,6 +291,13 @@ public final class SyncManager: @unchecked Sendable {
     /// Clear all sync timestamps (call when user logs out)
     public func clearSyncState() async {
         await timestampStorage.clearAll()
+
+        // Clear key-set pagination cursor IDs from UserDefaults
+        let tables = lock.withLock { Array(registrations.keys) }
+        for tableName in tables {
+            UserDefaults.standard.removeObject(forKey: "lastPullId_\(tableName)")
+        }
+
         lock.withLock {
             _userId = nil
             _syncingEnabled = false

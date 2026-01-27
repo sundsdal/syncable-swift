@@ -143,12 +143,13 @@ public final class SyncManager: @unchecked Sendable {
     /// Start the background sync loop with periodic sync attempts.
     ///
     /// The sync loop will:
-    /// - Sync at the specified interval
+    /// - Sync immediately on start, then at the specified interval
     /// - Automatically sync when network connectivity is restored
     /// - Apply exponential backoff on failures (1s → 2s → 4s → ... → 60s max)
     ///
     /// - Parameter interval: Time between sync attempts in seconds (default: 30)
     public func startSyncLoop(interval: TimeInterval = 30.0) {
+        stopSyncLoop()  // Cancel any existing loop first
         lock.withLock { _syncInterval = interval }
 
         // Start network monitor
@@ -163,18 +164,21 @@ public final class SyncManager: @unchecked Sendable {
             while !Task.isCancelled {
                 guard let self else { break }
 
-                let interval = self.lock.withLock { self._syncInterval }
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-
-                guard !Task.isCancelled else { break }
-
                 do {
                     try await self.sync()
                     self.lock.withLock { self._backoff.reset() }
                 } catch {
+                    // On failure, wait backoff delay then retry (no interval wait)
                     let delay = self.lock.withLock { self._backoff.recordFailure() }
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    continue
                 }
+
+                guard !Task.isCancelled else { break }
+
+                // On success, wait interval before next sync
+                let interval = self.lock.withLock { self._syncInterval }
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             }
         }
     }

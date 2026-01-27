@@ -50,7 +50,8 @@ final class NetworkMonitor: @unchecked Sendable {
             self.lock.withLock { self._isConnected = nowConnected }
 
             if !wasConnected && nowConnected {
-                self.lock.withLock { self._onConnectivityRestored }?()
+                let callback = self.lock.withLock { self._onConnectivityRestored }
+                callback?()
             }
         }
         monitor.start(queue: queue)
@@ -59,5 +60,6 @@ final class NetworkMonitor: @unchecked Sendable {
     /// Stop monitoring network connectivity
     func stop() {
         monitor.cancel()
+        lock.withLock { _onConnectivityRestored = nil }
     }
 }

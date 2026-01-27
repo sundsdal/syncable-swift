@@ -59,7 +59,7 @@ struct SyncManagerTests {
     }
 
     @Test("setUserId updates userId")
-    func setUserIdWorks() async throws {
+    func setUserIdWorks() throws {
         let dbQueue = try DatabaseQueue()
         let supabase = MockSupabaseClient()
         let storage = InMemorySyncTimestampStorage()
@@ -71,13 +71,13 @@ struct SyncManagerTests {
         )
 
         let userId = UUID()
-        await manager.setUserId(userId)
+        manager.setUserId(userId)
 
         #expect(manager.userId == userId)
     }
 
     @Test("setSyncingEnabled updates syncingEnabled")
-    func setSyncingEnabledWorks() async throws {
+    func setSyncingEnabledWorks() throws {
         let dbQueue = try DatabaseQueue()
         let supabase = MockSupabaseClient()
         let storage = InMemorySyncTimestampStorage()
@@ -89,7 +89,7 @@ struct SyncManagerTests {
         )
 
         #expect(manager.syncingEnabled == false)
-        await manager.setSyncingEnabled(true)
+        manager.setSyncingEnabled(true)
         #expect(manager.syncingEnabled == true)
     }
 
@@ -106,8 +106,8 @@ struct SyncManagerTests {
         )
 
         // Set up state
-        await manager.setUserId(UUID())
-        await manager.setSyncingEnabled(true)
+        manager.setUserId(UUID())
+        manager.setSyncingEnabled(true)
         await storage.setLastSyncTimestamp(Date(), for: "test")
 
         // Clear state
@@ -116,6 +116,22 @@ struct SyncManagerTests {
         #expect(manager.userId == nil)
         #expect(manager.syncingEnabled == false)
         #expect(await storage.getLastSyncTimestamp(for: "test") == nil)
+    }
+
+    @Test("syncStatus starts as idle")
+    func syncStatusStartsIdle() throws {
+        let dbQueue = try DatabaseQueue()
+        let supabase = MockSupabaseClient()
+        let storage = InMemorySyncTimestampStorage()
+
+        let manager = SyncManager(
+            dbWriter: dbQueue,
+            supabaseClient: supabase.client,
+            timestampStorage: storage
+        )
+
+        #expect(manager.syncStatus == .idle)
+        #expect(manager.lastSyncTime == nil)
     }
 }
 

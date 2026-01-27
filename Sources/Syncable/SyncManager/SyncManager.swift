@@ -24,12 +24,17 @@ import Supabase
 /// syncManager.register(Todo.self)
 ///
 /// // Set user and enable
-/// await syncManager.setUserId(currentUser.id)
-/// await syncManager.setSyncingEnabled(true)
+/// syncManager.setUserId(currentUser.id)
+/// syncManager.setSyncingEnabled(true)
 ///
 /// // Trigger sync
 /// try await syncManager.sync()
 /// ```
+///
+/// ## Thread Safety
+/// This class is marked `@unchecked Sendable` because thread safety is manually managed via `NSLock`.
+/// All mutable state (`_userId`, `_syncingEnabled`, `_syncStatus`, `registrations`) is protected by `lock`.
+/// Maintainers must acquire `lock` before reading or writing any of these properties.
 public final class SyncManager: @unchecked Sendable {
     // MARK: - Dependencies
 
@@ -47,6 +52,9 @@ public final class SyncManager: @unchecked Sendable {
     private let lock = NSLock()
     private var _userId: UUID?
     private var _syncingEnabled: Bool = false
+    private var _syncStatus: SyncStatus = .idle
+    private var _lastSyncTime: Date?
+    private var _onStatusChange: ((SyncStatus) -> Void)?
 
     // MARK: - Registrations
 
@@ -85,13 +93,36 @@ public final class SyncManager: @unchecked Sendable {
     }
 
     /// Set the current user ID
-    public func setUserId(_ userId: UUID?) async {
+    public func setUserId(_ userId: UUID?) {
         lock.withLock { _userId = userId }
     }
 
     /// Enable or disable syncing
-    public func setSyncingEnabled(_ enabled: Bool) async {
+    public func setSyncingEnabled(_ enabled: Bool) {
         lock.withLock { _syncingEnabled = enabled }
+    }
+
+    /// Current sync status
+    public var syncStatus: SyncStatus {
+        lock.withLock { _syncStatus }
+    }
+
+    /// Last successful sync time
+    public var lastSyncTime: Date? {
+        lock.withLock { _lastSyncTime }
+    }
+
+    /// Register a callback to be notified of sync status changes
+    public func onStatusChange(_ callback: @escaping (SyncStatus) -> Void) {
+        lock.withLock { _onStatusChange = callback }
+    }
+
+    private func updateStatus(_ status: SyncStatus) {
+        let callback: ((SyncStatus) -> Void)? = lock.withLock {
+            _syncStatus = status
+            return _onStatusChange
+        }
+        callback?(status)
     }
 
     // MARK: - Registration
@@ -117,11 +148,20 @@ public final class SyncManager: @unchecked Sendable {
         guard syncingEnabled else { return }
         guard userId != nil else { return }
 
+        updateStatus(.syncing)
+
         let currentRegistrations = lock.withLock { registrations }
 
-        for (_, registration) in currentRegistrations {
-            try await push(registration: registration)
-            try await pull(registration: registration)
+        do {
+            for (_, registration) in currentRegistrations {
+                try await push(registration: registration)
+                try await pull(registration: registration)
+            }
+            lock.withLock { _lastSyncTime = Date() }
+            updateStatus(.idle)
+        } catch {
+            updateStatus(.failed(error))
+            throw error
         }
     }
 
@@ -246,6 +286,31 @@ public final class SyncManager: @unchecked Sendable {
         lock.withLock {
             _userId = nil
             _syncingEnabled = false
+            _syncStatus = .idle
+            _lastSyncTime = nil
+        }
+    }
+}
+
+// MARK: - Sync Status
+
+/// Represents the current state of synchronization
+public enum SyncStatus: Equatable, Sendable {
+    /// No sync operation in progress
+    case idle
+    /// Sync operation is currently running
+    case syncing
+    /// Last sync operation failed with an error
+    case failed(Error)
+
+    public static func == (lhs: SyncStatus, rhs: SyncStatus) -> Bool {
+        switch (lhs, rhs) {
+        case (.idle, .idle), (.syncing, .syncing):
+            return true
+        case (.failed(let lhsError), .failed(let rhsError)):
+            return lhsError.localizedDescription == rhsError.localizedDescription
+        default:
+            return false
         }
     }
 }

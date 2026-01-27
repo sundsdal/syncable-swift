@@ -159,9 +159,10 @@ public final class SyncManager: @unchecked Sendable {
 
         // Encode items as array of AnyJSON for Supabase
         var jsonArray: [AnyJSON] = []
+        let decoder = JSONDecoder()
         for item in dirtyItems {
             let data = try registration.encode(item)
-            let json = try JSONDecoder().decode(AnyJSON.self, from: data)
+            let json = try decoder.decode(AnyJSON.self, from: data)
             jsonArray.append(json)
         }
 
@@ -203,7 +204,7 @@ public final class SyncManager: @unchecked Sendable {
 
         // Parse the array of items
         guard let jsonArray = try JSONSerialization.jsonObject(with: response.data) as? [[String: Any]] else {
-            return
+            throw SyncError.decodingFailed("Failed to parse JSON array from Supabase response")
         }
 
         // Process items and track max updated date

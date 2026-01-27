@@ -1,44 +1,119 @@
 import Foundation
-import SwiftData
+import GRDB
 
-/// Configuration for a registered syncable type.
+/// Registration information for a Syncable type with the SyncManager.
 ///
-/// Stores metadata and operations needed to sync a specific model type.
-public struct SyncableRegistration<T: SyncableProtocol>: Sendable {
-    /// The table name in Supabase
+/// This struct captures the type-erased operations needed to sync a specific model type.
+/// Created internally when you register a Syncable type with the SyncManager.
+public struct SyncableRegistration: Sendable {
+    /// The database/Supabase table name for this type
     public let tableName: String
 
-    /// Maximum retries before dead letter queue
-    public let maxRetries: Int
+    /// Decode JSON data into a Syncable instance
+    let decode: @Sendable (Data) throws -> any SyncableProtocol
 
-    /// Decode JSON data into the model type
-    public let decode: @Sendable (Data) throws -> T
+    /// Fetch all records for a user from the database
+    let fetchAll: @Sendable (Database, UUID?) throws -> [any SyncableProtocol]
 
-    public init(
-        tableName: String = T.tableName,
-        maxRetries: Int = T.maxSyncRetries,
-        decode: @escaping @Sendable (Data) throws -> T
-    ) {
-        self.tableName = tableName
-        self.maxRetries = maxRetries
-        self.decode = decode
+    /// Fetch dirty records that need to be pushed (syncedAt is nil OR updatedAt > syncedAt)
+    let fetchDirty: @Sendable (Database, UUID?, Int) throws -> [any SyncableProtocol]
+
+    /// Mark specific record IDs as synced (set syncedAt = updatedAt)
+    let markAsSynced: @Sendable ([UUID], Database) throws -> Void
+
+    /// Upsert a record into the database (LWW: only if newer)
+    let upsertIfNewer: @Sendable (any SyncableProtocol, Database) throws -> Void
+
+    /// Encode a record to JSON data for Supabase upload (excludes syncedAt)
+    let encode: @Sendable (any SyncableProtocol) throws -> Data
+
+    /// Create a registration for a specific Syncable type
+    public static func create<T: SyncableProtocol>(_ type: T.Type) -> SyncableRegistration {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        return SyncableRegistration(
+            tableName: T.databaseTableName,
+            decode: { data in
+                try decoder.decode(T.self, from: data)
+            },
+            fetchAll: { db, userId in
+                // Exclude deleted items by default (tombstones should not appear in UI)
+                var query = T.filter(SyncableColumns.deleted == false)
+                if let userId {
+                    query = query.filter(SyncableColumns.userId == userId)
+                }
+                return try query.fetchAll(db)
+            },
+            fetchDirty: { db, userId, limit in
+                // Dirty = syncedAt is NULL OR updatedAt > syncedAt
+                var query = T.filter(
+                    SyncableColumns.syncedAt == nil ||
+                    SyncableColumns.updatedAt > SyncableColumns.syncedAt
+                )
+                if let userId {
+                    query = query.filter(SyncableColumns.userId == userId)
+                }
+                return try query.limit(limit).fetchAll(db)
+            },
+            markAsSynced: { ids, db in
+                guard !ids.isEmpty else { return }
+                // Update syncedAt = updatedAt for these specific IDs
+                for id in ids {
+                    if var record = try T.fetchOne(db, key: id) {
+                        record.syncedAt = record.updatedAt
+                        try record.update(db)
+                    }
+                }
+            },
+            upsertIfNewer: { record, db in
+                guard let typedRecord = record as? T else {
+                    throw SyncableRegistrationError.typeMismatch
+                }
+
+                // LWW: Check if existing record and only update if incoming is newer
+                if let existing = try T.fetchOne(db, key: typedRecord.id) {
+                    if typedRecord.updatedAt > existing.updatedAt {
+                        // Preserve local syncedAt when updating from remote
+                        var updated = typedRecord
+                        updated.syncedAt = existing.syncedAt
+                        try updated.update(db)
+                    }
+                    // else: existing is newer, ignore incoming
+                } else {
+                    try typedRecord.insert(db)
+                }
+            },
+            encode: { record in
+                guard let typedRecord = record as? T else {
+                    throw SyncableRegistrationError.typeMismatch
+                }
+                // Encode to dictionary, remove syncedAt (local-only), then re-encode
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                let data = try encoder.encode(typedRecord)
+                guard var dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw SyncableRegistrationError.encodingFailed
+                }
+                // Remove local-only field before sending to backend
+                dict.removeValue(forKey: "syncedAt")
+                return try JSONSerialization.data(withJSONObject: dict)
+            }
+        )
     }
 }
 
-/// Type-erased registration for storing in collections
-public struct AnySyncableRegistration: Sendable {
-    public let tableName: String
-    public let maxRetries: Int
+/// Errors that can occur during registration operations
+public enum SyncableRegistrationError: Error, LocalizedError {
+    case typeMismatch
+    case encodingFailed
 
-    /// Decode and wrap in AnySyncable
-    public let decodeToAny: @Sendable (Data) throws -> AnySyncable
-
-    public init<T: SyncableProtocol>(_ registration: SyncableRegistration<T>) {
-        self.tableName = registration.tableName
-        self.maxRetries = registration.maxRetries
-        self.decodeToAny = { data in
-            let value = try registration.decode(data)
-            return AnySyncable(value)
+    public var errorDescription: String? {
+        switch self {
+        case .typeMismatch:
+            return "Type mismatch in SyncableRegistration"
+        case .encodingFailed:
+            return "Failed to encode record for sync"
         }
     }
 }

@@ -1,31 +1,48 @@
 import Testing
 import Foundation
+import GRDB
 @testable import Syncable
 
 /// Test model conforming to SyncableProtocol
 struct TestItem: SyncableProtocol {
-    let id: UUID
-    var userId: UUID
+    var id: UUID
+    var userId: UUID?
     var updatedAt: Date
     var deleted: Bool
-    var needsSync: Bool
-    var syncRetryCount: Int
+    var syncedAt: Date?
+    var title: String
 
     init(
         id: UUID = UUID(),
-        userId: UUID = UUID(),
+        userId: UUID? = UUID(),
         updatedAt: Date = Date(),
         deleted: Bool = false,
-        needsSync: Bool = false,
-        syncRetryCount: Int = 0
+        syncedAt: Date? = nil,
+        title: String = "Test"
     ) {
         self.id = id
         self.userId = userId
         self.updatedAt = updatedAt
         self.deleted = deleted
-        self.needsSync = needsSync
-        self.syncRetryCount = syncRetryCount
+        self.syncedAt = syncedAt
+        self.title = title
     }
+}
+
+/// Create an in-memory database with the TestItem table
+func makeTestDatabase() throws -> DatabaseQueue {
+    let dbQueue = try DatabaseQueue()
+    try dbQueue.write { db in
+        try db.create(table: "testitems") { t in
+            t.column("id", .text).primaryKey()
+            t.column("userId", .text)
+            t.column("updatedAt", .datetime).notNull()
+            t.column("deleted", .boolean).notNull().defaults(to: false)
+            t.column("syncedAt", .datetime)
+            t.column("title", .text).notNull()
+        }
+    }
+    return dbQueue
 }
 
 @Suite("SyncableProtocol Tests")
@@ -33,101 +50,301 @@ struct SyncableProtocolTests {
 
     @Test("Default table name is derived from type name")
     func defaultTableName() {
-        #expect(TestItem.tableName == "testitems")
+        #expect(TestItem.databaseTableName == "testitems")
     }
 
-    @Test("Default max retries is 3")
-    func defaultMaxRetries() {
-        #expect(TestItem.maxSyncRetries == 3)
+    @Test("Model conforms to FetchableRecord and PersistableRecord")
+    func grdbConformance() throws {
+        let dbQueue = try makeTestDatabase()
+        let item = TestItem()
+
+        // Insert
+        try dbQueue.write { db in
+            try item.insert(db)
+        }
+
+        // Fetch
+        let fetched = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: item.id)
+        }
+
+        #expect(fetched != nil)
+        #expect(fetched?.id == item.id)
+        #expect(fetched?.title == item.title)
     }
 
-    @Test("AnySyncable wraps model correctly")
-    func anySyncableWrapping() throws {
+    @Test("Model encodes to JSON correctly")
+    func jsonEncoding() throws {
         let item = TestItem(
             id: UUID(),
             userId: UUID(),
             updatedAt: Date(),
             deleted: false,
-            needsSync: true,
-            syncRetryCount: 2
+            title: "Test Title"
         )
-
-        let wrapped = AnySyncable(item)
-
-        #expect(wrapped.id == item.id)
-        #expect(wrapped.userId == item.userId)
-        #expect(wrapped.deleted == item.deleted)
-        #expect(wrapped.needsSync == item.needsSync)
-        #expect(wrapped.syncRetryCount == 2)
-        #expect(wrapped.tableName == "testitems")
-    }
-
-    @Test("AnySyncable encodes to JSON")
-    func anySyncableEncoding() throws {
-        let item = TestItem()
-        let wrapped = AnySyncable(item)
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
 
-        let data = try wrapped.encode(with: encoder)
-        #expect(!data.isEmpty)
+        let data = try encoder.encode(item)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
 
-        // Verify it's valid JSON
-        let json = try JSONSerialization.jsonObject(with: data)
-        #expect(json is [String: Any])
+        #expect(json != nil)
+        #expect(json?["title"] as? String == "Test Title")
+        #expect(json?["deleted"] as? Bool == false)
     }
 
-    @Test("hasExceededRetries returns correct value")
-    func retryExceeded() {
-        var item = TestItem(syncRetryCount: 2)
-        var wrapped = AnySyncable(item)
+    @Test("SyncableColumns can filter queries")
+    func columnFiltering() throws {
+        let dbQueue = try makeTestDatabase()
+        let userId = UUID()
 
-        #expect(!wrapped.hasExceededRetries(max: 3))
+        let item1 = TestItem(userId: userId, title: "Item 1")
+        let item2 = TestItem(userId: UUID(), title: "Item 2")
+        let item3 = TestItem(userId: userId, deleted: true, title: "Deleted")
 
-        item.syncRetryCount = 3
-        wrapped = AnySyncable(item)
-        #expect(wrapped.hasExceededRetries(max: 3))
+        try dbQueue.write { db in
+            try item1.insert(db)
+            try item2.insert(db)
+            try item3.insert(db)
+        }
 
-        item.syncRetryCount = 5
-        wrapped = AnySyncable(item)
-        #expect(wrapped.hasExceededRetries(max: 3))
+        // Filter by userId
+        let userItems = try dbQueue.read { db in
+            try TestItem.filter(SyncableColumns.userId == userId).fetchAll(db)
+        }
+        #expect(userItems.count == 2)
+
+        // Filter by deleted
+        let activeItems = try dbQueue.read { db in
+            try TestItem.filter(SyncableColumns.deleted == false).fetchAll(db)
+        }
+        #expect(activeItems.count == 2)
     }
 }
 
-@Suite("SyncQueueItem Tests")
-struct SyncQueueItemTests {
+@Suite("LWW Conflict Resolution Tests")
+struct LWWConflictTests {
 
-    @Test("Increment retry preserves other fields")
-    func incrementRetry() {
-        let item = SyncQueueItem(
-            id: UUID(),
-            tableName: "test",
-            data: Data(),
-            retryCount: 0
-        )
+    @Test("Newer update wins over older")
+    func newerWins() throws {
+        let dbQueue = try makeTestDatabase()
+        let id = UUID()
+        let oldDate = Date().addingTimeInterval(-100)
+        let newDate = Date()
 
-        let incremented = item.incrementingRetry(error: "Network error")
+        // Insert older record
+        let oldItem = TestItem(id: id, updatedAt: oldDate, title: "Old")
+        try dbQueue.write { db in
+            try oldItem.insert(db)
+        }
 
-        #expect(incremented.id == item.id)
-        #expect(incremented.tableName == item.tableName)
-        #expect(incremented.retryCount == 1)
-        #expect(incremented.lastError == "Network error")
+        // Try to update with newer record
+        let newItem = TestItem(id: id, updatedAt: newDate, title: "New")
+        try dbQueue.write { db in
+            if let existing = try TestItem.fetchOne(db, key: id) {
+                if newItem.updatedAt > existing.updatedAt {
+                    try newItem.update(db)
+                }
+            }
+        }
+
+        let result = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: id)
+        }
+        #expect(result?.title == "New")
     }
 
-    @Test("Multiple retries accumulate")
-    func multipleRetries() {
-        var item = SyncQueueItem(
-            id: UUID(),
-            tableName: "test",
-            data: Data()
-        )
+    @Test("Older update is ignored")
+    func olderIgnored() throws {
+        let dbQueue = try makeTestDatabase()
+        let id = UUID()
+        let oldDate = Date().addingTimeInterval(-100)
+        let newDate = Date()
 
-        item = item.incrementingRetry(error: "Error 1")
-        item = item.incrementingRetry(error: "Error 2")
-        item = item.incrementingRetry(error: "Error 3")
+        // Insert newer record first
+        let newItem = TestItem(id: id, updatedAt: newDate, title: "New")
+        try dbQueue.write { db in
+            try newItem.insert(db)
+        }
 
-        #expect(item.retryCount == 3)
-        #expect(item.lastError == "Error 3")
+        // Try to update with older record (should be ignored)
+        let oldItem = TestItem(id: id, updatedAt: oldDate, title: "Old")
+        try dbQueue.write { db in
+            if let existing = try TestItem.fetchOne(db, key: id) {
+                if oldItem.updatedAt > existing.updatedAt {
+                    try oldItem.update(db)
+                }
+            }
+        }
+
+        let result = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: id)
+        }
+        #expect(result?.title == "New")
+    }
+}
+
+@Suite("SyncableRegistration Tests")
+struct SyncableRegistrationTests {
+
+    @Test("Registration captures table name")
+    func registrationTableName() {
+        let registration = SyncableRegistration.create(TestItem.self)
+        #expect(registration.tableName == "testitems")
+    }
+
+    @Test("Registration can encode items")
+    func registrationEncode() throws {
+        let registration = SyncableRegistration.create(TestItem.self)
+        let item = TestItem(title: "Encode Test")
+
+        let data = try registration.encode(item)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+
+        #expect(json?["title"] as? String == "Encode Test")
+    }
+
+    @Test("Registration can decode items")
+    func registrationDecode() throws {
+        let registration = SyncableRegistration.create(TestItem.self)
+        let originalItem = TestItem(title: "Decode Test")
+
+        // Encode then decode
+        let data = try registration.encode(originalItem)
+        let decoded = try registration.decode(data) as? TestItem
+
+        #expect(decoded?.id == originalItem.id)
+        #expect(decoded?.title == "Decode Test")
+    }
+
+    @Test("Registration fetchDirty finds unsynced items")
+    func fetchDirtyFindsUnsynced() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+        let userId = UUID()
+
+        // Item with no syncedAt (dirty)
+        let unsyncedItem = TestItem(userId: userId, updatedAt: Date(), syncedAt: nil, title: "Unsynced")
+        // Item with syncedAt = updatedAt (clean)
+        let syncedItem = TestItem(userId: userId, updatedAt: Date(), syncedAt: Date(), title: "Synced")
+
+        try dbQueue.write { db in
+            try unsyncedItem.insert(db)
+            try syncedItem.insert(db)
+        }
+
+        let dirty = try dbQueue.read { db in
+            try registration.fetchDirty(db, userId, 100)
+        }
+
+        #expect(dirty.count == 1)
+        #expect((dirty.first as? TestItem)?.title == "Unsynced")
+    }
+
+    @Test("Registration fetchDirty finds modified items")
+    func fetchDirtyFindsModified() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+        let userId = UUID()
+
+        let syncTime = Date()
+        // Item modified after sync (dirty)
+        let modifiedItem = TestItem(userId: userId, updatedAt: syncTime.addingTimeInterval(100), syncedAt: syncTime, title: "Modified")
+        // Item not modified since sync (clean)
+        let cleanItem = TestItem(userId: userId, updatedAt: syncTime, syncedAt: syncTime, title: "Clean")
+
+        try dbQueue.write { db in
+            try modifiedItem.insert(db)
+            try cleanItem.insert(db)
+        }
+
+        let dirty = try dbQueue.read { db in
+            try registration.fetchDirty(db, userId, 100)
+        }
+
+        #expect(dirty.count == 1)
+        #expect((dirty.first as? TestItem)?.title == "Modified")
+    }
+
+    @Test("Registration markAsSynced updates syncedAt")
+    func markAsSyncedWorks() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+
+        let item = TestItem(updatedAt: Date(), syncedAt: nil, title: "Test")
+        try dbQueue.write { db in
+            try item.insert(db)
+        }
+
+        // Verify item is dirty before
+        let dirtyBefore = try dbQueue.read { db in
+            try registration.fetchDirty(db, nil, 100)
+        }
+        #expect(dirtyBefore.count == 1)
+
+        // Mark as synced
+        try dbQueue.write { db in
+            try registration.markAsSynced([item.id], db)
+        }
+
+        // Verify item is no longer dirty
+        let dirtyAfter = try dbQueue.read { db in
+            try registration.fetchDirty(db, nil, 100)
+        }
+        #expect(dirtyAfter.count == 0)
+
+        // Verify syncedAt was set
+        let fetched = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: item.id)
+        }
+        #expect(fetched?.syncedAt == fetched?.updatedAt)
+    }
+
+    @Test("Registration upsertIfNewer applies LWW")
+    func upsertIfNewer() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+        let id = UUID()
+
+        // Insert initial record
+        let initial = TestItem(id: id, updatedAt: Date(), title: "Initial")
+        try dbQueue.write { db in
+            try initial.insert(db)
+        }
+
+        // Upsert newer record
+        let newer = TestItem(id: id, updatedAt: Date().addingTimeInterval(100), title: "Newer")
+        try dbQueue.write { db in
+            try registration.upsertIfNewer(newer, db)
+        }
+
+        let result = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: id)
+        }
+        #expect(result?.title == "Newer")
+
+        // Upsert older record (should be ignored)
+        let older = TestItem(id: id, updatedAt: Date().addingTimeInterval(-100), title: "Older")
+        try dbQueue.write { db in
+            try registration.upsertIfNewer(older, db)
+        }
+
+        let finalResult = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: id)
+        }
+        #expect(finalResult?.title == "Newer") // Still "Newer", not "Older"
+    }
+
+    @Test("Registration encode excludes syncedAt")
+    func encodeExcludesSyncedAt() throws {
+        let registration = SyncableRegistration.create(TestItem.self)
+        let item = TestItem(syncedAt: Date(), title: "Test")
+
+        let data = try registration.encode(item)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+
+        #expect(json?["title"] as? String == "Test")
+        #expect(json?["syncedAt"] == nil) // Should be excluded
     }
 }

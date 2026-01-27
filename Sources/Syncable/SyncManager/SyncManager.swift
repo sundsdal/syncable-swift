@@ -33,7 +33,9 @@ import Supabase
 ///
 /// ## Thread Safety
 /// This class is marked `@unchecked Sendable` because thread safety is manually managed via `NSLock`.
-/// All mutable state (`_userId`, `_syncingEnabled`, `_syncStatus`, `registrations`) is protected by `lock`.
+/// All mutable state is protected by `lock`:
+/// - Core state: `_userId`, `_syncingEnabled`, `_syncStatus`, `_lastSyncTime`, `_onStatusChange`, `registrations`
+/// - Sync loop state: `_syncInterval`, `_backoff`, `syncLoopTask`, `networkMonitor`
 /// Maintainers must acquire `lock` before reading or writing any of these properties.
 public final class SyncManager: @unchecked Sendable {
     // MARK: - Dependencies
@@ -160,7 +162,7 @@ public final class SyncManager: @unchecked Sendable {
         lock.withLock { networkMonitor = monitor }
 
         // Start periodic sync task
-        syncLoopTask = Task { [weak self] in
+        let task = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { break }
 
@@ -181,13 +183,14 @@ public final class SyncManager: @unchecked Sendable {
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             }
         }
+        lock.withLock { syncLoopTask = task }
     }
 
     /// Stop the background sync loop
     public func stopSyncLoop() {
-        syncLoopTask?.cancel()
-        syncLoopTask = nil
         lock.withLock {
+            syncLoopTask?.cancel()
+            syncLoopTask = nil
             networkMonitor?.stop()
             networkMonitor = nil
             _backoff.reset()

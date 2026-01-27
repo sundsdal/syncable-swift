@@ -23,6 +23,18 @@ import GRDB
 /// }
 /// ```
 ///
+/// ## UUID Storage
+/// This protocol requires `Codable` conformance, which encodes UUIDs as strings.
+/// Your SQLite schema must use TEXT columns for `id` and `userId` to match:
+/// ```swift
+/// try db.create(table: "todos") { t in
+///     t.column("id", .text).primaryKey()
+///     t.column("userId", .text)
+///     // ...
+/// }
+/// ```
+/// This matches Supabase/PostgreSQL's UUID string format for seamless sync.
+///
 /// ## Clock Skew Warning (V1 Limitation)
 /// This library uses Last-Write-Wins (LWW) conflict resolution based on `updatedAt`.
 /// Client devices with drifted clocks may cause unexpected conflict outcomes.

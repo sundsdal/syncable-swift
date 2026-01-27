@@ -38,11 +38,12 @@ public struct SyncableRegistration: Sendable {
                 try decoder.decode(T.self, from: data)
             },
             fetchAll: { db, userId in
+                // Exclude deleted items by default (tombstones should not appear in UI)
+                var query = T.filter(SyncableColumns.deleted == false)
                 if let userId {
-                    return try T.filter(SyncableColumns.userId == userId).fetchAll(db)
-                } else {
-                    return try T.fetchAll(db)
+                    query = query.filter(SyncableColumns.userId == userId)
                 }
+                return try query.fetchAll(db)
             },
             fetchDirty: { db, userId, limit in
                 // Dirty = syncedAt is NULL OR updatedAt > syncedAt

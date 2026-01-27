@@ -1,9 +1,10 @@
-// Syncable - Offline-first sync for SwiftData + Supabase
+// Syncable - Offline-first sync for GRDB + Supabase
 // Inspired by https://github.com/Mr-Pepe/syncable
 
-// MARK: - Protocols
+// MARK: - Re-exports
 @_exported import Foundation
-public typealias Syncable = SyncableProtocol
+@_exported import GRDB
 
-// MARK: - Re-exports for convenience
-// Users can import just "Syncable" to get everything they need
+// MARK: - Type Aliases
+/// Convenience alias for the main syncable protocol
+public typealias Syncable = SyncableProtocol

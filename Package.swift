@@ -12,6 +12,10 @@ let package = Package(
         .library(
             name: "Syncable",
             targets: ["Syncable"]
+        ),
+        .executable(
+            name: "SyncableDemo",
+            targets: ["SyncableDemo"]
         )
     ],
     dependencies: [
@@ -23,6 +27,13 @@ let package = Package(
             name: "Syncable",
             dependencies: [
                 .product(name: "GRDB", package: "GRDB.swift"),
+                .product(name: "Supabase", package: "supabase-swift")
+            ]
+        ),
+        .executableTarget(
+            name: "SyncableDemo",
+            dependencies: [
+                "Syncable",
                 .product(name: "Supabase", package: "supabase-swift")
             ]
         ),

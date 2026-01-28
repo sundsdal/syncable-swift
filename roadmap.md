@@ -100,30 +100,53 @@
 
 ---
 
+## Phase 6: Realtime Subscriptions ✅
+
+- [x] Supabase Realtime integration
+- [x] `RealtimeSubscriptionManager` with actor-based concurrency
+- [x] `startRealtime()` / `stopRealtime()` methods on SyncManager
+- [x] `onRealtimeChange` callback for UI refresh
+
+## Phase 7: Echo Prevention ✅
+
+- [x] `EchoPreventionCache` to avoid re-syncing own changes
+- [x] TTL-based expiration for cache entries (60s default)
+- [x] Integration with push/pull cycle
+
+## Phase 8: Documentation & Examples ✅
+
+- [x] Comprehensive README with:
+  - [x] Installation instructions (SPM)
+  - [x] Quick Start section with demo link
+  - [x] Step-by-step usage guide
+  - [x] Column naming convention documentation
+  - [x] `syncedAt` explanation
+  - [x] Anonymous to authenticated flow
+  - [x] Error handling guidance
+  - [x] API reference tables
+- [x] CLI Demo app (`SyncableDemo`) with:
+  - [x] Complete `Todo` model example
+  - [x] Interactive commands (add, list, complete, delete, sync, online/offline)
+  - [x] Supabase migration file
+- [x] Technical design document (`technical_design.md`)
+
+---
+
 ## Future Work
 
-### Phase 6: Realtime Subscriptions
-- [ ] Supabase Realtime integration
-- [ ] `RealtimeSubscriptionManager` (skeleton exists)
-- [ ] Conditional subscriptions based on multi-device activity
-
-### Phase 7: Echo Prevention
-- [ ] Echo prevention cache to avoid re-syncing own changes
-- [ ] TTL-based expiration for cache entries
-
-### Phase 8: Optimizations
-- [ ] `lastTimeOtherDeviceWasActive` logic
+### Phase 9: Optimizations
+- [ ] `lastTimeOtherDeviceWasActive` logic for conditional realtime
 - [ ] GRDB `ValueObservation` for reactive UI updates
 
-### Phase 9: Advanced Features
+### Phase 10: Advanced Features
 - [ ] Dead letter queue for failed items
 - [ ] Retry logic with configurable max attempts
 - [ ] Conflict resolution callbacks (custom merge strategies)
 
-### Phase 10: Documentation & Examples
-- [ ] Example app with SwiftUI + GRDB + Syncable
-- [ ] "Getting Started" guide
-- [ ] "Offline First Best Practices" guide
+### Phase 11: SwiftUI Example App
+- [ ] Full SwiftUI app demonstrating Syncable integration
+- [ ] MVVM architecture with sync-aware ViewModels
+- [ ] Network status indicator in UI
 
 ---
 
@@ -139,11 +162,15 @@
 | UserDefaultsSyncTimestampStorage | ✅ |
 | SyncableRegistration | ✅ |
 | SyncManager | ✅ |
-| Push sync (updatedAt > lastPushed) | ✅ |
+| Push sync (dirty detection via syncedAt) | ✅ |
 | Pull sync with LWW | ✅ |
 | ExponentialBackoff | ✅ |
 | NetworkMonitor | ✅ |
 | Background Sync Loop | ✅ |
-| Unit tests (48 passing) | ✅ |
+| Realtime Subscriptions | ✅ |
+| Echo Prevention Cache | ✅ |
+| CLI Demo (SyncableDemo) | ✅ |
+| Comprehensive README | ✅ |
+| Unit tests | ✅ |
 | technical_design.md | ✅ |
 | roadmap.md | ✅ |

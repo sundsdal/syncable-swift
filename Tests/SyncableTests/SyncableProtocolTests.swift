@@ -4,6 +4,7 @@ import GRDB
 @testable import Syncable
 
 /// Test model conforming to SyncableProtocol
+/// No CodingKeys needed - library handles snake_case conversion for Supabase
 struct TestItem: SyncableProtocol {
     var id: UUID
     var userId: UUID?
@@ -29,7 +30,7 @@ struct TestItem: SyncableProtocol {
     }
 }
 
-/// Create an in-memory database with the TestItem table
+/// Create an in-memory database with the TestItem table (camelCase columns)
 func makeTestDatabase() throws -> DatabaseQueue {
     let dbQueue = try DatabaseQueue()
     try dbQueue.write { db in
@@ -272,9 +273,14 @@ struct SyncableRegistrationTests {
         let dbQueue = try makeTestDatabase()
         let registration = SyncableRegistration.create(TestItem.self)
 
-        let item = TestItem(updatedAt: Date(), syncedAt: nil, title: "Test")
+        var item = TestItem(updatedAt: Date(), syncedAt: nil, title: "Test")
         try dbQueue.write { db in
             try item.insert(db)
+        }
+
+        // Re-read the item to get the exact stored updatedAt (SQLite may have different precision)
+        let storedItem = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: item.id)!
         }
 
         // Verify item is dirty before
@@ -283,9 +289,9 @@ struct SyncableRegistrationTests {
         }
         #expect(dirtyBefore.count == 1)
 
-        // Mark as synced
+        // Mark as synced (passing the exact updatedAt from the database)
         try dbQueue.write { db in
-            try registration.markAsSynced([item.id], db)
+            try registration.markAsSynced([(id: storedItem.id, pushedUpdatedAt: storedItem.updatedAt)], db)
         }
 
         // Verify item is no longer dirty
@@ -299,6 +305,53 @@ struct SyncableRegistrationTests {
             try TestItem.fetchOne(db, key: item.id)
         }
         #expect(fetched?.syncedAt == fetched?.updatedAt)
+    }
+
+    @Test("Registration markAsSynced ignores modified records")
+    func markAsSyncedIgnoresModified() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+
+        // Create and insert item
+        let originalUpdatedAt = Date()
+        var item = TestItem(updatedAt: originalUpdatedAt, syncedAt: nil, title: "Test")
+        try dbQueue.write { db in
+            try item.insert(db)
+        }
+
+        // Get the exact stored updatedAt (simulating what push() captures)
+        let storedItem = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: item.id)!
+        }
+        let pushedUpdatedAt = storedItem.updatedAt
+
+        // Simulate a local edit that happens AFTER push captures the dirty items
+        // but BEFORE markAsSynced is called
+        try dbQueue.write { db in
+            var modified = try TestItem.fetchOne(db, key: item.id)!
+            modified.title = "Modified after push"
+            modified.updatedAt = Date().addingTimeInterval(1)  // Newer timestamp
+            try modified.update(db)
+        }
+
+        // Try to mark as synced with the OLD updatedAt
+        // This should NOT mark it as synced because updatedAt changed
+        try dbQueue.write { db in
+            try registration.markAsSynced([(id: item.id, pushedUpdatedAt: pushedUpdatedAt)], db)
+        }
+
+        // Verify item is still dirty (because it was modified after push)
+        let dirty = try dbQueue.read { db in
+            try registration.fetchDirty(db, nil, 100)
+        }
+        #expect(dirty.count == 1)
+
+        // Verify syncedAt is still nil (not marked as synced)
+        let fetched = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: item.id)
+        }
+        #expect(fetched?.syncedAt == nil)
+        #expect(fetched?.title == "Modified after push")
     }
 
     @Test("Registration upsertIfNewer applies LWW")
@@ -336,7 +389,7 @@ struct SyncableRegistrationTests {
         #expect(finalResult?.title == "Newer") // Still "Newer", not "Older"
     }
 
-    @Test("Registration encode excludes syncedAt")
+    @Test("Registration encode excludes synced_at")
     func encodeExcludesSyncedAt() throws {
         let registration = SyncableRegistration.create(TestItem.self)
         let item = TestItem(syncedAt: Date(), title: "Test")
@@ -345,6 +398,75 @@ struct SyncableRegistrationTests {
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
 
         #expect(json?["title"] as? String == "Test")
-        #expect(json?["syncedAt"] == nil) // Should be excluded
+        #expect(json?["synced_at"] == nil) // Should be excluded (snake_case)
+    }
+
+    @Test("Registration assignUserIdToOrphans assigns userId to null records")
+    func assignUserIdToOrphans() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+        let newUserId = UUID()
+
+        // Create orphaned items (userId = nil)
+        let orphan1 = TestItem(userId: nil, title: "Orphan 1")
+        let orphan2 = TestItem(userId: nil, title: "Orphan 2")
+        // Create owned item (should not be modified)
+        let existingUserId = UUID()
+        let owned = TestItem(userId: existingUserId, title: "Owned")
+
+        try dbQueue.write { db in
+            try orphan1.insert(db)
+            try orphan2.insert(db)
+            try owned.insert(db)
+        }
+
+        // Assign userId to orphans
+        let count = try dbQueue.write { db in
+            try registration.assignUserIdToOrphans(newUserId, db)
+        }
+
+        #expect(count == 2)
+
+        // Verify orphans now have userId
+        let items = try dbQueue.read { db in
+            try TestItem.fetchAll(db)
+        }
+
+        let claimedOrphan1 = items.first { $0.id == orphan1.id }
+        let claimedOrphan2 = items.first { $0.id == orphan2.id }
+        let unchanged = items.first { $0.id == owned.id }
+
+        #expect(claimedOrphan1?.userId == newUserId)
+        #expect(claimedOrphan2?.userId == newUserId)
+        #expect(unchanged?.userId == existingUserId) // Should not be modified
+    }
+
+    @Test("Registration assignUserIdToOrphans marks records as dirty")
+    func assignUserIdToOrphansMarksDirty() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+
+        // Create orphan that was previously "synced"
+        let syncTime = Date().addingTimeInterval(-100)
+        let orphan = TestItem(userId: nil, updatedAt: syncTime, syncedAt: syncTime, title: "Orphan")
+
+        try dbQueue.write { db in
+            try orphan.insert(db)
+        }
+
+        // Assign userId
+        let newUserId = UUID()
+        _ = try dbQueue.write { db in
+            try registration.assignUserIdToOrphans(newUserId, db)
+        }
+
+        // Verify record is now dirty (syncedAt = nil, updatedAt updated)
+        let updated = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: orphan.id)
+        }
+
+        #expect(updated?.syncedAt == nil)
+        #expect(updated?.updatedAt ?? Date.distantPast > syncTime)
+        #expect(updated?.userId == newUserId)
     }
 }

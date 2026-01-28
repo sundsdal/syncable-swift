@@ -9,6 +9,7 @@ import Supabase
 /// - Pull: Supabase changes → Local (using LWW conflict resolution)
 /// - Registration of Syncable types
 /// - Timestamp tracking for incremental sync
+/// - Optional realtime subscriptions for instant sync on remote changes
 ///
 /// ## Usage
 /// ```swift
@@ -36,6 +37,7 @@ import Supabase
 /// All mutable state is protected by `lock`:
 /// - Core state: `_userId`, `_syncingEnabled`, `_syncStatus`, `_lastSyncTime`, `_onStatusChange`, `registrations`
 /// - Sync loop state: `_syncInterval`, `_backoff`, `syncLoopTask`, `networkMonitor`
+/// - Statistics: `_nSyncedToBackend`, `_nSyncedFromBackend`
 /// Maintainers must acquire `lock` before reading or writing any of these properties.
 public final class SyncManager: @unchecked Sendable {
     // MARK: - Dependencies
@@ -57,6 +59,7 @@ public final class SyncManager: @unchecked Sendable {
     private var _syncStatus: SyncStatus = .idle
     private var _lastSyncTime: Date?
     private var _onStatusChange: ((SyncStatus) -> Void)?
+    private var _onRealtimeChange: ((String) -> Void)?  // Called with table name when realtime change pulled
 
     // MARK: - Sync Loop State (protected by lock)
 
@@ -64,6 +67,20 @@ public final class SyncManager: @unchecked Sendable {
     private var _backoff = ExponentialBackoff()
     private var syncLoopTask: Task<Void, Never>?
     private var networkMonitor: NetworkMonitor?
+
+    // MARK: - Realtime State (protected by lock)
+
+    private var realtimeManager: RealtimeSubscriptionManager?
+    private let _echoCache = EchoPreventionCache()  // Reference type, safe to use under lock
+    /// Tracks in-progress pulls per table to prevent concurrent cursor updates
+    private var _pullInProgress: Set<String> = []
+    /// Prevents concurrent full sync operations
+    private var _syncInProgress: Bool = false
+
+    // MARK: - Statistics (protected by lock)
+
+    private var _nSyncedToBackend: Int = 0
+    private var _nSyncedFromBackend: Int = 0
 
     // MARK: - Registrations
 
@@ -87,6 +104,27 @@ public final class SyncManager: @unchecked Sendable {
         self.supabaseClient = supabaseClient
         self.timestampStorage = timestampStorage
         self.maxRows = maxRows
+    }
+
+    deinit {
+        // Cancel any running tasks to prevent resource leaks
+        lock.withLock {
+            syncLoopTask?.cancel()
+            syncLoopTask = nil
+            networkMonitor?.stop()
+            networkMonitor = nil
+        }
+
+        // Fire detached task to clean up realtime subscriptions
+        // Cannot await in deinit, but this ensures channels are properly closed
+        let manager = lock.withLock {
+            let m = realtimeManager
+            realtimeManager = nil
+            return m
+        }
+        if let manager {
+            Task.detached { await manager.unsubscribeAll() }
+        }
     }
 
     // MARK: - Thread-safe property access
@@ -126,6 +164,12 @@ public final class SyncManager: @unchecked Sendable {
         lock.withLock { _onStatusChange = callback }
     }
 
+    /// Register a callback to be notified when realtime changes are pulled
+    /// - Parameter callback: Called with the table name when changes are pulled via realtime
+    public func onRealtimeChange(_ callback: @escaping (String) -> Void) {
+        lock.withLock { _onRealtimeChange = callback }
+    }
+
     private func updateStatus(_ status: SyncStatus) {
         let callback: ((SyncStatus) -> Void)? = lock.withLock {
             _syncStatus = status
@@ -138,6 +182,26 @@ public final class SyncManager: @unchecked Sendable {
     public var syncInterval: TimeInterval {
         get { lock.withLock { _syncInterval } }
         set { lock.withLock { _syncInterval = newValue } }
+    }
+
+    // MARK: - Statistics
+
+    /// Total number of records pushed to backend since last reset
+    public var nSyncedToBackend: Int {
+        lock.withLock { _nSyncedToBackend }
+    }
+
+    /// Total number of records pulled from backend since last reset
+    public var nSyncedFromBackend: Int {
+        lock.withLock { _nSyncedFromBackend }
+    }
+
+    /// Reset sync statistics counters to zero
+    public func resetStatistics() {
+        lock.withLock {
+            _nSyncedToBackend = 0
+            _nSyncedFromBackend = 0
+        }
     }
 
     // MARK: - Sync Loop
@@ -197,6 +261,107 @@ public final class SyncManager: @unchecked Sendable {
         }
     }
 
+    // MARK: - Realtime Subscriptions
+
+    /// Start realtime subscriptions for all registered tables.
+    ///
+    /// When enabled, the SyncManager will receive instant notifications of remote
+    /// changes and automatically pull updates. Echo prevention ensures that
+    /// recently pushed changes are not pulled back unnecessarily.
+    ///
+    /// - Note: Requires `userId` to be set. Call after `setUserId(_:)`.
+    /// - Throws: `SyncError.userIdNotSet` if userId is nil, or subscription errors.
+    public func startRealtime() async throws {
+        guard let currentUserId = userId else {
+            throw SyncError.userIdNotSet
+        }
+
+        // Stop any existing manager first to ensure a clean state
+        await stopRealtime()
+
+        let manager = RealtimeSubscriptionManager(
+            supabase: supabaseClient,
+            userId: currentUserId,
+            onRemoteChange: { [weak self] tableName, recordId in
+                await self?.handleRemoteChange(tableName: tableName, recordId: recordId)
+            }
+        )
+
+        // Assign the manager immediately so stopRealtime() can clean up on failure
+        lock.withLock { realtimeManager = manager }
+
+        do {
+            // Subscribe to all registered tables
+            let tables = registeredTables
+            for table in tables {
+                try await manager.subscribe(to: table)
+            }
+        } catch {
+            // On failure, clean up any partial subscriptions and rethrow
+            await stopRealtime()
+            throw error
+        }
+    }
+
+    /// Stop realtime subscriptions for all tables.
+    public func stopRealtime() async {
+        let manager = lock.withLock {
+            let m = realtimeManager
+            realtimeManager = nil
+            return m
+        }
+        await manager?.unsubscribeAll()
+    }
+
+    /// Handle a remote change notification from realtime subscription
+    ///
+    /// Pulls are serialized per table to prevent concurrent cursor updates from
+    /// regressing the pagination cursor. If a pull is already in progress for
+    /// this table (or a full sync is running), we skip - the in-progress operation
+    /// will fetch all changes.
+    private func handleRemoteChange(tableName: String, recordId: UUID) async {
+        // Check echo cache - skip if we just pushed this record
+        let wasEcho = lock.withLock { _echoCache.wasRecentlyPushed(recordId) }
+        if wasEcho { return }
+
+        // Coalesce concurrent pulls: skip if a full sync or table pull is already in progress
+        let shouldPull = lock.withLock {
+            // Skip if a full sync is running - it will pull all tables anyway
+            if _syncInProgress {
+                return false
+            }
+            if _pullInProgress.contains(tableName) {
+                return false  // Pull already running, it will fetch this change
+            }
+            _pullInProgress.insert(tableName)
+            return true
+        }
+
+        guard shouldPull else { return }
+
+        defer {
+            lock.withLock { _ = _pullInProgress.remove(tableName) }
+        }
+
+        // Pull changes for this table
+        if let registration = lock.withLock({ registrations[tableName] }) {
+            do {
+                try await pull(registration: registration)
+
+                // Notify listener of realtime change
+                let callback = lock.withLock { _onRealtimeChange }
+                callback?(tableName)
+            } catch {
+                // Log error but don't propagate - realtime pulls are best-effort
+                // The next scheduled sync or manual sync will retry
+                #if DEBUG
+                print("[SyncManager] Realtime pull failed for \(tableName): \(error.localizedDescription)")
+                #endif
+                updateStatus(.failed(error))
+            }
+        }
+    }
+
     // MARK: - Registration
 
     /// Register a Syncable type for synchronization
@@ -216,9 +381,25 @@ public final class SyncManager: @unchecked Sendable {
     // MARK: - Sync Operations
 
     /// Perform a full sync cycle (push then pull) for all registered types
+    ///
+    /// Sync operations are serialized - if a sync is already in progress,
+    /// this call will return immediately without doing anything.
+    /// This prevents concurrent syncs from causing cursor regression.
     public func sync() async throws {
         guard syncingEnabled else { return }
         guard userId != nil else { return }
+
+        // Prevent concurrent sync operations
+        let shouldSync = lock.withLock {
+            if _syncInProgress { return false }
+            _syncInProgress = true
+            return true
+        }
+        guard shouldSync else { return }
+
+        defer {
+            lock.withLock { _syncInProgress = false }
+        }
 
         updateStatus(.syncing)
 
@@ -285,9 +466,19 @@ public final class SyncManager: @unchecked Sendable {
             .execute()
 
         // Mark successfully synced items (per-row tracking prevents data loss)
-        let syncedIds = dirtyItems.map(\.id)
+        // Pass both ID and updatedAt to prevent race condition: if record was modified
+        // after we fetched dirty items, the updatedAt won't match and it stays dirty
+        let syncedItems = dirtyItems.map { (id: $0.id, pushedUpdatedAt: $0.updatedAt) }
         try await dbWriter.write { db in
-            try registration.markAsSynced(syncedIds, db)
+            try registration.markAsSynced(syncedItems, db)
+        }
+
+        // Mark pushed IDs in echo cache and update statistics
+        lock.withLock {
+            for (id, _) in syncedItems {
+                _echoCache.markAsPushed(id)
+            }
+            _nSyncedToBackend += syncedItems.count
         }
     }
 
@@ -298,9 +489,9 @@ public final class SyncManager: @unchecked Sendable {
         let lastPullKey = "lastPull_\(tableName)"
         let lastPullIdKey = "lastPullId_\(tableName)"
 
-        // Key-set pagination state
+        // Key-set pagination state (using consistent storage abstraction)
         let lastPulledTime = await timestampStorage.getLastSyncTimestamp(for: lastPullKey)
-        let lastPulledIdString = UserDefaults.standard.string(forKey: lastPullIdKey)
+        let lastPulledIdString = await timestampStorage.getCursorId(for: lastPullIdKey)
         let lastPulledId = lastPulledIdString.flatMap { UUID(uuidString: $0) }
 
         // Build query with key-set pagination to avoid missing records at timestamp boundaries
@@ -351,31 +542,81 @@ public final class SyncManager: @unchecked Sendable {
             }
         }
 
+        // Update statistics
+        lock.withLock {
+            _nSyncedFromBackend += items.count
+        }
+
         // Update key-set pagination cursor
         if let lastItem {
             await timestampStorage.setLastSyncTimestamp(lastItem.updatedAt, for: lastPullKey)
-            UserDefaults.standard.set(lastItem.id.uuidString, forKey: lastPullIdKey)
+            await timestampStorage.setCursorId(lastItem.id.uuidString, for: lastPullIdKey)
         }
+    }
+
+    // MARK: - Anonymous to Authenticated Flow
+
+    /// Assign the current userId to all orphaned records (where userId is nil).
+    ///
+    /// Call this after a user signs in to claim any data created while anonymous.
+    /// Orphaned records will be updated with the current userId and marked dirty for sync.
+    ///
+    /// ## Usage
+    /// ```swift
+    /// // User creates items while logged out (userId is nil in local DB)
+    /// let todo = Todo(id: UUID(), userId: nil, ...)
+    /// try db.write { try todo.insert($0) }
+    ///
+    /// // Later, user signs in
+    /// syncManager.setUserId(authenticatedUser.id)
+    /// let count = try await syncManager.fillMissingUserIdForLocalTables()
+    /// print("Claimed \(count) orphaned records")
+    ///
+    /// // Now sync to push the claimed records to backend
+    /// syncManager.setSyncingEnabled(true)
+    /// try await syncManager.sync()
+    /// ```
+    ///
+    /// - Returns: Total count of records that were assigned a userId
+    /// - Throws: Database errors if the update fails
+    @discardableResult
+    public func fillMissingUserIdForLocalTables() async throws -> Int {
+        guard let currentUserId = userId else {
+            return 0
+        }
+
+        let currentRegistrations = lock.withLock { registrations }
+
+        let totalCount = try await dbWriter.write { db -> Int in
+            var count = 0
+            for (_, registration) in currentRegistrations {
+                count += try registration.assignUserIdToOrphans(currentUserId, db)
+            }
+            return count
+        }
+
+        return totalCount
     }
 
     // MARK: - Utilities
 
-    /// Clear all sync timestamps (call when user logs out)
+    /// Clear all sync state (call when user logs out)
+    ///
+    /// This clears all timestamps, cursor IDs, and resets the manager state.
     public func clearSyncState() async {
         stopSyncLoop()
+        await stopRealtime()
+        // clearAll() clears both timestamps and cursor IDs via the storage abstraction
         await timestampStorage.clearAll()
-
-        // Clear key-set pagination cursor IDs from UserDefaults
-        let tables = lock.withLock { Array(registrations.keys) }
-        for tableName in tables {
-            UserDefaults.standard.removeObject(forKey: "lastPullId_\(tableName)")
-        }
 
         lock.withLock {
             _userId = nil
             _syncingEnabled = false
             _syncStatus = .idle
             _lastSyncTime = nil
+            _echoCache.clear()
+            _nSyncedToBackend = 0
+            _nSyncedFromBackend = 0
         }
     }
 }
@@ -411,6 +652,7 @@ public enum SyncError: Error, LocalizedError {
     case encodingFailed(String)
     case decodingFailed(String)
     case networkError(Error)
+    case userIdNotSet
 
     public var errorDescription: String? {
         switch self {
@@ -422,6 +664,8 @@ public enum SyncError: Error, LocalizedError {
             return "Failed to decode from sync: \(message)"
         case .networkError(let error):
             return "Network error during sync: \(error.localizedDescription)"
+        case .userIdNotSet:
+            return "userId must be set before calling this method"
         }
     }
 }

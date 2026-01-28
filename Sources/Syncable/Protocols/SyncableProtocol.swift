@@ -7,6 +7,7 @@ import GRDB
 /// The protocol ensures models have the necessary fields for conflict resolution and soft deletion.
 ///
 /// ## Usage
+/// Just define your model with standard Swift camelCase properties - no CodingKeys needed:
 /// ```swift
 /// struct Todo: SyncableProtocol {
 ///     var id: UUID
@@ -15,25 +16,41 @@ import GRDB
 ///     var deleted: Bool
 ///     var syncedAt: Date?  // Local-only, tracks last successful sync
 ///     var title: String
-///
-///     // GRDB column mapping
-///     enum Columns: String, ColumnExpression {
-///         case id, userId, updatedAt, deleted, syncedAt, title
-///     }
 /// }
 /// ```
 ///
-/// ## UUID Storage
-/// This protocol requires `Codable` conformance, which encodes UUIDs as strings.
-/// Your SQLite schema must use TEXT columns for `id` and `userId` to match:
+/// ## Automatic snake_case Conversion
+/// The library automatically converts between Swift camelCase and PostgreSQL snake_case
+/// when syncing with Supabase. You don't need to think about it:
+/// - Your Swift code uses `userId`, `updatedAt`
+/// - Your local SQLite uses `userId`, `updatedAt` (camelCase)
+/// - Supabase uses `user_id`, `updated_at` (snake_case) - handled by the library
+///
+/// ## Local SQLite Schema (camelCase)
+/// Use standard Swift naming in your local database:
 /// ```swift
 /// try db.create(table: "todos") { t in
 ///     t.column("id", .text).primaryKey()
 ///     t.column("userId", .text)
-///     // ...
+///     t.column("updatedAt", .datetime).notNull()
+///     t.column("deleted", .boolean).notNull()
+///     t.column("syncedAt", .datetime)  // Local-only
+///     t.column("title", .text).notNull()
 /// }
 /// ```
-/// This matches Supabase/PostgreSQL's UUID string format for seamless sync.
+///
+/// ## Supabase Schema (snake_case)
+/// Your Supabase table uses standard PostgreSQL conventions:
+/// ```sql
+/// CREATE TABLE todos (
+///     id UUID PRIMARY KEY,
+///     user_id UUID NOT NULL,
+///     updated_at TIMESTAMPTZ NOT NULL,
+///     deleted BOOLEAN NOT NULL DEFAULT false,
+///     title TEXT NOT NULL
+///     -- Note: no synced_at column - it's local-only
+/// );
+/// ```
 ///
 /// ## Clock Skew Warning (V1 Limitation)
 /// This library uses Last-Write-Wins (LWW) conflict resolution based on `updatedAt`.
@@ -72,8 +89,9 @@ public extension SyncableProtocol {
     }
 }
 
-/// Column expressions for common Syncable fields
-/// Use these when building GRDB queries on Syncable types
+/// Column expressions for common Syncable fields.
+/// Use these when building GRDB queries on Syncable types.
+/// These match Swift property names - use camelCase in your SQLite schema.
 public enum SyncableColumns: String, ColumnExpression {
     case id
     case userId

@@ -12,6 +12,14 @@ struct TestItem: SyncableProtocol {
     var syncedAt: Date?
     var title: String
 
+    // CodingKeys for snake_case (PostgreSQL convention)
+    enum CodingKeys: String, CodingKey {
+        case id, deleted, title
+        case userId = "user_id"
+        case updatedAt = "updated_at"
+        case syncedAt = "synced_at"
+    }
+
     init(
         id: UUID = UUID(),
         userId: UUID? = UUID(),
@@ -29,16 +37,16 @@ struct TestItem: SyncableProtocol {
     }
 }
 
-/// Create an in-memory database with the TestItem table
+/// Create an in-memory database with the TestItem table (snake_case columns)
 func makeTestDatabase() throws -> DatabaseQueue {
     let dbQueue = try DatabaseQueue()
     try dbQueue.write { db in
         try db.create(table: "testitems") { t in
             t.column("id", .text).primaryKey()
-            t.column("userId", .text)
-            t.column("updatedAt", .datetime).notNull()
+            t.column("user_id", .text)
+            t.column("updated_at", .datetime).notNull()
             t.column("deleted", .boolean).notNull().defaults(to: false)
-            t.column("syncedAt", .datetime)
+            t.column("synced_at", .datetime)
             t.column("title", .text).notNull()
         }
     }
@@ -336,7 +344,7 @@ struct SyncableRegistrationTests {
         #expect(finalResult?.title == "Newer") // Still "Newer", not "Older"
     }
 
-    @Test("Registration encode excludes syncedAt")
+    @Test("Registration encode excludes synced_at")
     func encodeExcludesSyncedAt() throws {
         let registration = SyncableRegistration.create(TestItem.self)
         let item = TestItem(syncedAt: Date(), title: "Test")
@@ -345,6 +353,6 @@ struct SyncableRegistrationTests {
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
 
         #expect(json?["title"] as? String == "Test")
-        #expect(json?["syncedAt"] == nil) // Should be excluded
+        #expect(json?["synced_at"] == nil) // Should be excluded (snake_case)
     }
 }

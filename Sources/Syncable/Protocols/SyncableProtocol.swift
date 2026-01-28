@@ -16,20 +16,26 @@ import GRDB
 ///     var syncedAt: Date?  // Local-only, tracks last successful sync
 ///     var title: String
 ///
-///     // GRDB column mapping
-///     enum Columns: String, ColumnExpression {
-///         case id, userId, updatedAt, deleted, syncedAt, title
+///     // CodingKeys for snake_case (PostgreSQL convention)
+///     enum CodingKeys: String, CodingKey {
+///         case id, deleted, title
+///         case userId = "user_id"
+///         case updatedAt = "updated_at"
+///         case syncedAt = "synced_at"
 ///     }
 /// }
 /// ```
 ///
-/// ## UUID Storage
-/// This protocol requires `Codable` conformance, which encodes UUIDs as strings.
-/// Your SQLite schema must use TEXT columns for `id` and `userId` to match:
+/// ## Column Naming Convention
+/// This library uses **snake_case** column names to match PostgreSQL/Supabase conventions.
+/// Your SQLite schema must use snake_case and TEXT for UUIDs:
 /// ```swift
 /// try db.create(table: "todos") { t in
 ///     t.column("id", .text).primaryKey()
-///     t.column("userId", .text)
+///     t.column("user_id", .text)
+///     t.column("updated_at", .datetime).notNull()
+///     t.column("deleted", .boolean).notNull()
+///     t.column("synced_at", .datetime)  // Local-only
 ///     // ...
 /// }
 /// ```
@@ -72,12 +78,12 @@ public extension SyncableProtocol {
     }
 }
 
-/// Column expressions for common Syncable fields
+/// Column expressions for common Syncable fields (snake_case for PostgreSQL compatibility)
 /// Use these when building GRDB queries on Syncable types
 public enum SyncableColumns: String, ColumnExpression {
     case id
-    case userId
-    case updatedAt
+    case userId = "user_id"
+    case updatedAt = "updated_at"
     case deleted
-    case syncedAt
+    case syncedAt = "synced_at"
 }

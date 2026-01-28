@@ -88,15 +88,15 @@ public struct SyncableRegistration: Sendable {
                 guard let typedRecord = record as? T else {
                     throw SyncableRegistrationError.typeMismatch
                 }
-                // Encode to dictionary, remove syncedAt (local-only), then re-encode
+                // Encode to dictionary, remove synced_at (local-only), then re-encode
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601
                 let data = try encoder.encode(typedRecord)
                 guard var dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     throw SyncableRegistrationError.encodingFailed
                 }
-                // Remove local-only field before sending to backend
-                dict.removeValue(forKey: "syncedAt")
+                // Remove local-only field before sending to backend (snake_case from CodingKeys)
+                dict.removeValue(forKey: "synced_at")
                 return try JSONSerialization.data(withJSONObject: dict)
             }
         )

@@ -42,15 +42,22 @@ struct SyncableDemo {
             print("   Set USER_ID env var to use a specific user\n")
         }
 
-        // Initialize GRDB database (in-memory for demo, use file path for persistence)
+        // Initialize GRDB database
         let dbPath = FileManager.default.temporaryDirectory.appendingPathComponent("syncable-demo.sqlite").path
+        let dbExists = FileManager.default.fileExists(atPath: dbPath)
         let dbQueue = try DatabaseQueue(path: dbPath)
-        print("📁 Database: \(dbPath)\n")
 
-        // Create the todos table
+        if dbExists {
+            print("📁 Database: \(dbPath) (existing)")
+        } else {
+            print("📁 Database: \(dbPath) (created new)")
+        }
+
+        // Create the todos table (if not exists)
         try await dbQueue.write { db in
             try Todo.createTable(in: db)
         }
+        print("")
 
         // Initialize Supabase client
         let supabase = SupabaseClient(

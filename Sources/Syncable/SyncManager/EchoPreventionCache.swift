@@ -7,9 +7,18 @@ import Foundation
 /// immediately, wasting bandwidth and potentially causing sync loops.
 ///
 /// ## Thread Safety
-/// This is a reference type (class) to ensure mutations persist when used within
-/// lock-protected code blocks. Struct value semantics would cause mutations to
-/// only affect copies, breaking echo prevention.
+/// This class is marked `@unchecked Sendable` because it has NO internal synchronization.
+/// It is NOT thread-safe on its own.
+///
+/// **IMPORTANT**: This class MUST only be accessed while holding the `SyncManager`'s lock.
+/// All access in `SyncManager` follows this pattern:
+/// ```swift
+/// lock.withLock { _echoCache.markAsPushed(id) }
+/// ```
+///
+/// The class is a reference type (not struct) to ensure mutations persist when used within
+/// lock-protected code blocks. Struct value semantics would cause mutations to only affect
+/// copies, breaking echo prevention.
 ///
 /// ## Usage
 /// ```swift

@@ -40,6 +40,11 @@ import Supabase
 /// - Statistics: `_nSyncedToBackend`, `_nSyncedFromBackend`
 /// Maintainers must acquire `lock` before reading or writing any of these properties.
 public final class SyncManager: @unchecked Sendable {
+    private enum PullContext {
+        case fullSync
+        case manual
+        case realtime
+    }
     // MARK: - Dependencies
 
     private let dbWriter: any DatabaseWriter
@@ -324,29 +329,14 @@ public final class SyncManager: @unchecked Sendable {
         let wasEcho = lock.withLock { _echoCache.wasRecentlyPushed(recordId) }
         if wasEcho { return }
 
-        // Coalesce concurrent pulls: skip if a full sync or table pull is already in progress
-        let shouldPull = lock.withLock {
-            // Skip if a full sync is running - it will pull all tables anyway
-            if _syncInProgress {
-                return false
-            }
-            if _pullInProgress.contains(tableName) {
-                return false  // Pull already running, it will fetch this change
-            }
-            _pullInProgress.insert(tableName)
-            return true
-        }
-
-        guard shouldPull else { return }
-
-        defer {
-            lock.withLock { _ = _pullInProgress.remove(tableName) }
-        }
+        // Skip realtime pulls while a full sync is running
+        let isSyncing = lock.withLock { _syncInProgress }
+        if isSyncing { return }
 
         // Pull changes for this table
         if let registration = lock.withLock({ registrations[tableName] }) {
             do {
-                try await pull(registration: registration)
+                try await pull(registration: registration, context: .realtime)
 
                 // Notify listener of realtime change
                 let callback = lock.withLock { _onRealtimeChange }
@@ -408,7 +398,7 @@ public final class SyncManager: @unchecked Sendable {
         do {
             for (_, registration) in currentRegistrations {
                 try await push(registration: registration)
-                try await pull(registration: registration)
+                try await pull(registration: registration, context: .fullSync)
             }
             lock.withLock { _lastSyncTime = Date() }
             updateStatus(.idle)
@@ -431,7 +421,7 @@ public final class SyncManager: @unchecked Sendable {
         guard let registration = lock.withLock({ registrations[T.databaseTableName] }) else {
             throw SyncError.typeNotRegistered(T.databaseTableName)
         }
-        try await pull(registration: registration)
+        try await pull(registration: registration, context: .manual)
     }
 
     // MARK: - Private Sync Implementation
@@ -448,14 +438,10 @@ public final class SyncManager: @unchecked Sendable {
 
         guard !dirtyItems.isEmpty else { return }
 
-        // Encode items as array of AnyJSON for Supabase
-        // TODO: Optimize double encoding overhead - currently: Model -> Data -> AnyJSON -> Data
-        // Consider having registration return a type-erased Encodable wrapper instead
+        // Encode items directly to AnyJSON for Supabase (no double encoding)
         var jsonArray: [AnyJSON] = []
-        let decoder = JSONDecoder()
         for item in dirtyItems {
-            let data = try registration.encode(item)
-            let json = try decoder.decode(AnyJSON.self, from: data)
+            let json = try registration.encodeToJSON(item)
             jsonArray.append(json)
         }
 
@@ -482,10 +468,26 @@ public final class SyncManager: @unchecked Sendable {
         }
     }
 
-    private func pull(registration: SyncableRegistration) async throws {
+    private func pull(registration: SyncableRegistration, context: PullContext) async throws {
+        // Coalesce concurrent pulls per table across all entry points
+        let tableName = registration.tableName
+        let shouldPull = lock.withLock {
+            // Skip manual/realtime pulls while a full sync is running
+            if context != .fullSync, _syncInProgress {
+                return false
+            }
+            if _pullInProgress.contains(tableName) {
+                return false
+            }
+            _pullInProgress.insert(tableName)
+            return true
+        }
+
+        guard shouldPull else { return }
+        defer { lock.withLock { _ = _pullInProgress.remove(tableName) } }
+
         guard let currentUserId = userId else { return }
 
-        let tableName = registration.tableName
         let lastPullKey = "lastPull_\(tableName)"
         let lastPullIdKey = "lastPullId_\(tableName)"
 

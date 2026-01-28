@@ -16,7 +16,7 @@ import GRDB
 ///     var syncedAt: Date?  // Local-only, tracks last successful sync
 ///     var title: String
 ///
-///     // CodingKeys for snake_case (PostgreSQL convention)
+///     // CodingKeys map Swift camelCase to PostgreSQL snake_case
 ///     enum CodingKeys: String, CodingKey {
 ///         case id, deleted, title
 ///         case userId = "user_id"
@@ -26,9 +26,27 @@ import GRDB
 /// }
 /// ```
 ///
-/// ## Column Naming Convention
-/// This library uses **snake_case** column names to match PostgreSQL/Supabase conventions.
-/// Your SQLite schema must use snake_case and TEXT for UUIDs:
+/// ## Why CodingKeys Are Required
+/// GRDB uses Swift's `Codable` for database operations. Since your SQLite schema uses
+/// snake_case columns (to match Supabase), you need `CodingKeys` to map between:
+/// - Swift properties: `userId`, `updatedAt`, `syncedAt`
+/// - Database columns: `user_id`, `updated_at`, `synced_at`
+///
+/// This mapping works for both GRDB (local SQLite) and Supabase (remote PostgreSQL).
+///
+/// ## Schema Setup
+/// Your Supabase table uses standard PostgreSQL snake_case:
+/// ```sql
+/// CREATE TABLE todos (
+///     id UUID PRIMARY KEY,
+///     user_id UUID NOT NULL,
+///     updated_at TIMESTAMPTZ NOT NULL,
+///     deleted BOOLEAN NOT NULL DEFAULT false,
+///     title TEXT NOT NULL
+/// );
+/// ```
+///
+/// Your local SQLite schema should match:
 /// ```swift
 /// try db.create(table: "todos") { t in
 ///     t.column("id", .text).primaryKey()
@@ -39,7 +57,6 @@ import GRDB
 ///     // ...
 /// }
 /// ```
-/// This matches Supabase/PostgreSQL's UUID string format for seamless sync.
 ///
 /// ## Clock Skew Warning (V1 Limitation)
 /// This library uses Last-Write-Wins (LWW) conflict resolution based on `updatedAt`.

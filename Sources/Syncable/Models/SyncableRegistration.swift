@@ -35,6 +35,7 @@ public struct SyncableRegistration: Sendable {
     public static func create<T: SyncableProtocol>(_ type: T.Type) -> SyncableRegistration {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
+        // Note: No key conversion - models use CodingKeys for GRDB compatibility
 
         return SyncableRegistration(
             tableName: T.databaseTableName,
@@ -98,6 +99,7 @@ public struct SyncableRegistration: Sendable {
                 // Encode to dictionary, remove synced_at (local-only), then re-encode
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601
+                // Note: No key conversion - models use CodingKeys for GRDB compatibility
                 let data = try encoder.encode(typedRecord)
                 guard var dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     throw SyncableRegistrationError.encodingFailed

@@ -12,7 +12,7 @@ struct TestItem: SyncableProtocol {
     var syncedAt: Date?
     var title: String
 
-    // CodingKeys for snake_case (PostgreSQL convention)
+    // CodingKeys required for GRDB compatibility with snake_case schema
     enum CodingKeys: String, CodingKey {
         case id, deleted, title
         case userId = "user_id"

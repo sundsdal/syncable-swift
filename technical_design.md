@@ -42,6 +42,7 @@ public protocol SyncableProtocol: Codable, FetchableRecord, PersistableRecord, I
     var userId: UUID? { get set }
     var updatedAt: Date { get set }
     var deleted: Bool { get set }
+    var syncedAt: Date? { get set }  // Local-only: tracks sync state
 
     static var databaseTableName: String { get }
 }
@@ -61,8 +62,18 @@ struct Todo: SyncableProtocol {
     var userId: UUID?
     var updatedAt: Date
     var deleted: Bool
+    var syncedAt: Date?  // Local-only
     var title: String
     var isCompleted: Bool
+
+    // CodingKeys for snake_case (PostgreSQL convention)
+    enum CodingKeys: String, CodingKey {
+        case id, deleted, title
+        case userId = "user_id"
+        case updatedAt = "updated_at"
+        case syncedAt = "synced_at"
+        case isCompleted = "is_completed"
+    }
 
     // Optional: custom table name (default derived from type name)
     // static var databaseTableName: String { "todos" }
@@ -94,13 +105,21 @@ public struct SyncableRegistration: Sendable {
     public let tableName: String
     let decode: @Sendable (Data) throws -> any SyncableProtocol
     let fetchAll: @Sendable (Database, UUID?) throws -> [any SyncableProtocol]
-    let fetchUpdatedSince: @Sendable (Database, Date?, UUID?) throws -> [any SyncableProtocol]
+    let fetchDirty: @Sendable (Database, UUID?, Int) throws -> [any SyncableProtocol]
+    let markAsSynced: @Sendable ([UUID], Database) throws -> Void
     let upsertIfNewer: @Sendable (any SyncableProtocol, Database) throws -> Void
     let encode: @Sendable (any SyncableProtocol) throws -> Data
+    let assignUserIdToOrphans: @Sendable (UUID, Database) throws -> Int
 
     public static func create<T: SyncableProtocol>(_ type: T.Type) -> SyncableRegistration
 }
 ```
+
+**Key operations:**
+- `fetchDirty`: Finds records where `syncedAt IS NULL OR updatedAt > syncedAt`
+- `markAsSynced`: Sets `syncedAt = updatedAt` for successfully pushed records
+- `upsertIfNewer`: Applies LWW conflict resolution on pull
+- `assignUserIdToOrphans`: Claims anonymous records when user signs in
 
 ### 4. SyncManager
 
@@ -139,15 +158,13 @@ public final class SyncManager: @unchecked Sendable {
 
 ### Outgoing Sync (Local → Backend)
 
-The push operation uses timestamp comparison to find dirty records:
+The push operation uses per-record `syncedAt` tracking to find dirty records:
 
 ```swift
 private func push(registration: SyncableRegistration) async throws {
-    let lastPushed = await timestampStorage.getLastSyncTimestamp(for: "lastPush_\(tableName)")
-
-    // Fetch items modified since last push
+    // Fetch dirty items: syncedAt IS NULL OR updatedAt > syncedAt
     let dirtyItems = try await dbWriter.read { db in
-        try registration.fetchUpdatedSince(db, lastPushed, currentUserId)
+        try registration.fetchDirty(db, currentUserId, maxRows)
     }
 
     guard !dirtyItems.isEmpty else { return }
@@ -158,13 +175,15 @@ private func push(registration: SyncableRegistration) async throws {
         .upsert(jsonArray)
         .execute()
 
-    // Update last pushed timestamp
-    let maxUpdatedAt = dirtyItems.map(\.updatedAt).max()!
-    await timestampStorage.setLastSyncTimestamp(maxUpdatedAt, for: "lastPush_\(tableName)")
+    // Mark successfully pushed items as synced (sets syncedAt = updatedAt)
+    let syncedIds = dirtyItems.map(\.id)
+    try await dbWriter.write { db in
+        try registration.markAsSynced(syncedIds, db)
+    }
 }
 ```
 
-**Crash Resilience:** If the app crashes, the `updatedAt` of local items remains newer than `lastPushedAt`, so they will be picked up on restart.
+**Crash Resilience:** Per-record tracking means if the app crashes mid-sync, only successfully pushed records are marked as synced. Unpushed records remain dirty and will sync on restart.
 
 ### Incoming Sync (Backend → Local)
 
@@ -258,24 +277,52 @@ Supabase tables should have:
 - `updated_at` (timestamp with time zone)
 - `deleted` (boolean, default false)
 
+**Note:** The `synced_at` field is local-only and should NOT be in the Supabase table.
+
 Example Postgres table:
 
 ```sql
+-- LWW conflict resolution function (create once per project)
+CREATE OR REPLACE FUNCTION discard_older_updates()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.updated_at > NEW.updated_at THEN
+        RETURN OLD;  -- Keep the existing (newer) row
+    END IF;
+    RETURN NEW;  -- Allow the update
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create table
 CREATE TABLE todos (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES auth.users(id),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-    deleted BOOLEAN DEFAULT FALSE,
+    user_id UUID NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deleted BOOLEAN NOT NULL DEFAULT FALSE,
     title TEXT NOT NULL,
-    is_completed BOOLEAN DEFAULT FALSE
+    is_completed BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+-- Indexes
+CREATE INDEX todos_user_id_idx ON todos(user_id);
+CREATE INDEX todos_updated_at_idx ON todos(updated_at);
+
+-- LWW trigger
+CREATE TRIGGER todos_lww_conflict_resolution
+BEFORE UPDATE ON todos
+FOR EACH ROW EXECUTE FUNCTION discard_older_updates();
+
+-- Enable Realtime
+ALTER PUBLICATION supabase_realtime ADD TABLE todos;
 
 -- Enable RLS
 ALTER TABLE todos ENABLE ROW LEVEL SECURITY;
 
 -- RLS policy
-CREATE POLICY "Users can access own todos" ON todos
-    FOR ALL USING (auth.uid() = user_id);
+CREATE POLICY "Users can manage their own todos" ON todos
+    FOR ALL
+    USING (user_id = auth.uid())
+    WITH CHECK (user_id = auth.uid());
 ```
 
 ## Dependencies

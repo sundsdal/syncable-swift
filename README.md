@@ -1,200 +1,227 @@
-# Syncable-Swift
+# Syncable
 
-Offline-first multi-device data synchronization for SwiftData + Supabase.
+[![Swift](https://img.shields.io/badge/Swift-5.10-orange.svg)](https://swift.org)
+[![Platform](https://img.shields.io/badge/Platform-iOS%20%7C%20macOS-lightgrey.svg)]()
 
-Inspired by [Mr-Pepe/syncable](https://github.com/Mr-Pepe/syncable) (Dart/Flutter).
+Syncable is a library for offline-first multi-device data synchronization in Swift apps (iOS/macOS).
 
-## Features
+It was inspired by the [Dart/Flutter Syncable library](https://github.com/Mr-Pepe/syncable).
+The library provides a `SyncManager` class that handles data synchronization across devices.
+Conflicts are resolved based on the last time an item was updated.
+This means that if one item is modified offline on multiple devices, the version with
+the newer timestamp overwrites the other one when the devices go online.
 
-- **Offline-first**: Changes are persisted locally and synced when online
-- **Crash resilient**: Uses persistent dirty flags, not in-memory queues
-- **Multi-device**: Real-time sync via Supabase Realtime
-- **Conflict resolution**: Last-Write-Wins based on `updatedAt` timestamps
-- **Dead letter queue**: Failed items don't block the sync queue
-- **Background processing**: Uses `ModelActor` to keep UI responsive
+This implementation uses **GRDB** (SQLite) for local storage and **Supabase** for the backend.
 
-## Requirements
+## Usage 📖
 
-- iOS 17+ / macOS 14+
-- Swift 5.10+
-- Supabase project
+This section assumes that you already know how to work with [GRDB](https://github.com/groue/GRDB.swift) and [Supabase](https://supabase.com/).
 
-## Installation
+Setting up syncing requires some work, but we will go through it step by step.
+
+### Set up the local database 🗄️
+
+1. **Define a syncable:**
+   Every item you want to synchronize must:
+
+   - Conform to the `SyncableProtocol`.
+   - Be a GRDB `FetchableRecord` and `PersistableRecord`.
+   - Be `Codable` for serialization to the backend.
+
+   ```swift
+   import GRDB
+   import Syncable
+
+   struct Item: SyncableProtocol {
+       // SyncableProtocol requirements
+       var id: UUID
+       var userId: UUID?
+       var updatedAt: Date
+       var deleted: Bool
+       var syncedAt: Date? // Local-only, tracks sync state
+
+       // Your fields
+       var name: String
+
+       // GRDB Table definition
+       static var databaseTableName: String { "items" }
+   }
+   ```
+
+2. **Define a syncable table:**
+   Create the table in your GRDB database. You must include the columns required by `SyncableProtocol`.
+
+   ```swift
+   try db.create(table: "items") { t in
+       t.column("id", .text).primaryKey()
+       t.column("userId", .text) // Nullable for offline creation
+       t.column("updatedAt", .datetime).notNull()
+       t.column("deleted", .boolean).notNull().defaults(to: false)
+       t.column("syncedAt", .datetime) // Local-only column
+
+       t.column("name", .text).notNull()
+   }
+   ```
+
+### Set up the backend 🛠️
+
+1. **Enable real-time:**
+   The `SyncManager` must be able to establish a real-time connection to the backend to listen for changes.
+
+   ```sql
+   begin;
+   drop publication if exists supabase_realtime;
+   create publication supabase_realtime;
+   commit;
+   ```
+
+2. **Create a function to reject old items:**
+   The backend must resolve conflicts by rejecting items that have an older
+   `updatedAt` timestamp than what is already in the backend database.
+
+   ```sql
+   create or replace function discard_older_updates()
+   returns trigger as $$
+   BEGIN
+       IF NEW.updated_at <= OLD.updated_at THEN
+           RETURN NULL; -- Discard the incoming row
+       END IF;
+       RETURN NEW; -- Allow the update to proceed
+   END;
+   $$ language plpgsql;
+   ```
+
+3. **Create a table to sync to:**
+   Make sure to enable real-time and the conflict resolution function for your table.
+
+   ```sql
+   create table
+   items (
+       id uuid not null,
+       user_id uuid not null references auth.users (id) on delete cascade,
+       updated_at timestamptz not null,
+       deleted boolean not null,
+       name text not null,
+       primary key (id, user_id)
+   );
+
+   create trigger handle_conflicts
+   before update on items
+   for each row
+   execute function discard_older_updates();
+
+   alter publication supabase_realtime add table items;
+   ```
+
+4. **(Optional) Enable Row-level security (RLS):**
+   Allow users to only create, read, update, and delete their own items.
+
+   ```sql
+   alter table items enable row level security;
+
+   create policy "Users can work with own data"
+   on public.items
+   for all
+   using (
+       (auth.uid() = user_id)
+   );
+   ```
+
+### Start synchronization 🔄
+
+1.  **Create a sync manager:**
+
+    ```swift
+    let syncManager = SyncManager(
+        dbWriter: dbQueue, // Your GRDB DatabaseWriter
+        supabaseClient: supabaseClient,
+        timestampStorage: UserDefaultsSyncTimestampStorage()
+    )
+    ```
+
+2.  **Register syncables:**
+
+    ```swift
+    syncManager.register(Item.self)
+    ```
+
+3.  **Set a user ID:**
+
+    ```swift
+    syncManager.setUserId(supabaseClient.auth.currentUser?.id)
+    ```
+
+    Syncing will only work if a user ID is set.
+
+4.  **Enable syncing:**
+
+    ```swift
+    syncManager.setSyncingEnabled(true)
+    ```
+
+    Use `setSyncingEnabled(false)` if you only want to enable syncing under
+    certain conditions, e.g., if a Wi-Fi network is available.
+
+The sync manager now does a couple of things in the background:
+
+- It tracks changes to the local database. "Dirty" items (where `syncedAt` is nil or older than `updatedAt`) are picked up by the sync loop.
+- It listens to changes to the backend database via Realtime (if enabled).
+- A loop running in the background checks for dirty items and writes them to the backend. It also periodically pulls changes from the backend.
+- Use `syncManager.startSyncLoop()` to start this background process.
+
+> ⚠️ Don't forget to update the `updatedAt` timestamp whenever you change an item.
+> Use UTC timestamps to make sure that synchronization works when users change time zones.
+
+### Delete items 🗑️
+
+Items should be soft-deleted to correctly propagate deletions across devices.
+When deleting an item, set its `deleted` field to `true` and don't forget to
+update its `updatedAt` field.
+
+> ⚠️ Soft-deletion means that your client-side code needs to filter out deleted items in your UI queries.
+
+### Fill user ID after registration/sign-in 👤
+
+If a user creates items while not logged in, set the `userId` field to `nil`.
+Once the user signs in, you should update your local records with the new user ID.
 
 ```swift
-// Package.swift
-dependencies: [
-    .package(url: "https://github.com/your-org/syncable-swift.git", from: "1.0.0")
-]
-```
-
-## Quick Start
-
-### 1. Define Your Model
-
-```swift
-import SwiftData
-import Syncable
-
-@Model
-final class Todo: SyncableProtocol {
-    @Attribute(.unique) var id: UUID
-    var userId: UUID
-    var updatedAt: Date
-    var deleted: Bool
-    var needsSync: Bool
-    var syncRetryCount: Int
-
-    // Your fields
-    var title: String
-    var completed: Bool
-
-    init(title: String, userId: UUID) {
-        self.id = UUID()
-        self.userId = userId
-        self.updatedAt = Date()
-        self.deleted = false
-        self.needsSync = true  // Mark for sync on creation
-        self.syncRetryCount = 0
-        self.title = title
-        self.completed = false
-    }
+try dbQueue.write { db in
+    try Item
+        .filter(Column("userId") == nil)
+        .updateAll(db, Column("userId").set(to: newUserId))
 }
 ```
 
-### 2. Initialize SyncManager
+If syncing is enabled, those items will then get synced to the backend automatically.
+
+### Optimizations ⚡
+
+There are a few mechanisms that can drastically reduce the ongoing data
+usage for synchronization.
+
+#### Persistently store synchronization timestamps
+
+By default, the `SyncManager` needs to know the last time it synced to fetch only incremental changes.
+
+To only sync incremental changes, provide a `SyncTimestampStorage` implementation to the sync manager.
+The library provides `UserDefaultsSyncTimestampStorage` which persists these timestamps in `UserDefaults` across app restarts.
 
 ```swift
-import Syncable
-import Supabase
-
-let supabase = SupabaseClient(
-    supabaseURL: URL(string: "https://xxx.supabase.co")!,
-    supabaseKey: "your-anon-key"
-)
-
-let syncManager = SyncManagerActor(
-    modelContainer: modelContainer,
-    supabase: supabase,
-    userId: currentUserId
-)
-
-// Register your models
-await syncManager.register(Todo.self)
+let timestampStorage = UserDefaultsSyncTimestampStorage()
+let syncManager = SyncManager(..., timestampStorage: timestampStorage)
 ```
 
-### 3. Trigger Sync
+#### Realtime Subscriptions
+
+You can enable Realtime subscriptions to instantly receive updates from other devices.
 
 ```swift
-// Manual sync
-try await syncManager.sync()
-
-// Observe state in SwiftUI
-@State private var syncState = syncManager.state
-
-var body: some View {
-    VStack {
-        if syncState.status == .syncing {
-            ProgressView()
-        }
-        Text("Last sync: \(syncState.lastSyncDate ?? Date(), style: .relative)")
-    }
-}
+try await syncManager.startRealtime()
 ```
 
-## Supabase Setup
-
-### Create Table
-
-```sql
-CREATE TABLE todos (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES auth.users(id),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted BOOLEAN NOT NULL DEFAULT false,
-    title TEXT NOT NULL,
-    completed BOOLEAN NOT NULL DEFAULT false
-);
-
--- Enable RLS
-ALTER TABLE todos ENABLE ROW LEVEL SECURITY;
-
--- RLS Policy: users can only access their own data
-CREATE POLICY "Users can manage their own todos"
-    ON todos
-    FOR ALL
-    USING (auth.uid() = user_id);
-```
-
-### Conflict Resolution Trigger
-
-```sql
--- Prevent older updates from overwriting newer data
-CREATE OR REPLACE FUNCTION discard_older_updates()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF OLD.updated_at > NEW.updated_at THEN
-        RETURN OLD;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER prevent_older_updates
-    BEFORE UPDATE ON todos
-    FOR EACH ROW
-    EXECUTE FUNCTION discard_older_updates();
-```
-
-### Enable Realtime
-
-```sql
--- Enable realtime for the table
-ALTER PUBLICATION supabase_realtime ADD TABLE todos;
-```
-
-## Known Limitations (V1)
-
-### Clock Skew
-
-This library uses Last-Write-Wins (LWW) conflict resolution based on client `updatedAt` timestamps. Devices with drifted clocks may cause unexpected results:
-
-- A device with a clock 5 minutes ahead will "win" against valid updates
-- The server trigger protects server state but can't fix bad client timestamps
-- Consider server-side timestamp assignment for critical applications
-
-### Soft Deletes Only
-
-Records are never hard-deleted during sync. The `deleted` flag is set to `true` instead. Implement periodic cleanup separately if needed.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    SyncManagerActor                     │
-│                  (Background ModelActor)                │
-├─────────────────────────────────────────────────────────┤
-│  ┌───────────────┐  ┌───────────────┐  ┌─────────────┐ │
-│  │ ChangeObserver│  │ RealtimeSub   │  │ SyncState   │ │
-│  │ (NSNotification)│ │ (Supabase)    │  │ (MainActor) │ │
-│  └───────────────┘  └───────────────┘  └─────────────┘ │
-├─────────────────────────────────────────────────────────┤
-│                  Local SwiftData Store                  │
-│           (needsSync flag = persistent queue)           │
-└─────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────┐
-│                  Supabase Backend                       │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐ │
-│  │  REST API   │  │  Realtime   │  │  RLS Policies   │ │
-│  └─────────────┘  └─────────────┘  └─────────────────┘ │
-└─────────────────────────────────────────────────────────┘
-```
-
-## Credits
-
-This library is a Swift implementation inspired by [Mr-Pepe/syncable](https://github.com/Mr-Pepe/syncable), a Dart/Flutter library for offline-first synchronization.
+To prevent "echoes" (receiving your own changes back), the `SyncManager` implements an echo prevention mechanism.
+However, maintaining many realtime connections can be expensive. Consider enabling this only when the app is active.
 
 ## License
 

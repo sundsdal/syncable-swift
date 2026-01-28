@@ -40,7 +40,10 @@ let package = Package(
         ),
         .testTarget(
             name: "SyncableTests",
-            dependencies: ["Syncable"]
+            dependencies: [
+                "Syncable",
+                .product(name: "Supabase", package: "supabase-swift")
+            ]
         )
     ]
 )

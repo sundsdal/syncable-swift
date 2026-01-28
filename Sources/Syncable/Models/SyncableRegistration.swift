@@ -1,5 +1,6 @@
 import Foundation
 import GRDB
+import Supabase
 
 /// Registration information for a Syncable type with the SyncManager.
 ///
@@ -25,8 +26,8 @@ public struct SyncableRegistration: Sendable {
     /// Upsert a record into the database (LWW: only if newer)
     let upsertIfNewer: @Sendable (any SyncableProtocol, Database) throws -> Void
 
-    /// Encode a record to JSON data for Supabase upload (excludes syncedAt)
-    let encode: @Sendable (any SyncableProtocol) throws -> Data
+    /// Encode a record to AnyJSON for Supabase upload (excludes syncedAt)
+    let encodeToJSON: @Sendable (any SyncableProtocol) throws -> AnyJSON
 
     /// Assign userId to orphaned records (where userId is nil) and mark them dirty for sync
     /// Returns the count of records updated
@@ -35,7 +36,17 @@ public struct SyncableRegistration: Sendable {
     /// Create a registration for a specific Syncable type
     public static func create<T: SyncableProtocol>(_ type: T.Type) -> SyncableRegistration {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let dateString = try container.decode(String.self)
+            if let date = Date(iso8601String: dateString) {
+                return date
+            }
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Invalid ISO8601 date: \(dateString)"
+            )
+        }
         decoder.keyDecodingStrategy = .convertFromSnakeCase  // Supabase snake_case → Swift camelCase
 
         return SyncableRegistration(
@@ -103,13 +114,16 @@ public struct SyncableRegistration: Sendable {
                     try newRecord.insert(db)
                 }
             },
-            encode: { record in
+            encodeToJSON: { record in
                 guard let typedRecord = record as? T else {
                     throw SyncableRegistrationError.typeMismatch
                 }
-                // Encode to dictionary, remove syncedAt (local-only), then re-encode
+                // Encode to dictionary, remove syncedAt (local-only), then convert to AnyJSON
                 let encoder = JSONEncoder()
-                encoder.dateEncodingStrategy = .iso8601
+                encoder.dateEncodingStrategy = .custom { date, encoder in
+                    var container = encoder.singleValueContainer()
+                    try container.encode(date.iso8601String)
+                }
                 encoder.keyEncodingStrategy = .convertToSnakeCase  // Swift camelCase → Supabase snake_case
                 let data = try encoder.encode(typedRecord)
                 guard var dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -117,7 +131,8 @@ public struct SyncableRegistration: Sendable {
                 }
                 // Remove local-only field before sending to backend (snake_case after conversion)
                 dict.removeValue(forKey: "synced_at")
-                return try JSONSerialization.data(withJSONObject: dict)
+                // Convert dictionary directly to AnyJSON (no re-serialization to Data)
+                return convertDictionaryToAnyJSON(dict)
             },
             assignUserIdToOrphans: { userId, db in
                 // Find all records where userId is nil (created while anonymous)
@@ -149,5 +164,39 @@ public enum SyncableRegistrationError: Error, LocalizedError {
         case .encodingFailed:
             return "Failed to encode record for sync"
         }
+    }
+}
+
+// MARK: - AnyJSON Conversion Helpers
+
+/// Convert a Foundation dictionary to AnyJSON without re-serializing to Data.
+/// This avoids the overhead of: dict -> Data -> AnyJSON
+private func convertDictionaryToAnyJSON(_ dict: [String: Any]) -> AnyJSON {
+    .object(dict.mapValues { convertValueToAnyJSON($0) })
+}
+
+/// Convert a Foundation value (from JSONSerialization) to AnyJSON
+private func convertValueToAnyJSON(_ value: Any) -> AnyJSON {
+    switch value {
+    case let string as String:
+        return .string(string)
+    case let number as NSNumber:
+        // NSNumber can represent bools, ints, or doubles
+        // Check for bool first (NSNumber stores bools as 0/1)
+        if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            return .bool(number.boolValue)
+        } else if number.doubleValue == Double(number.intValue) {
+            return .integer(number.intValue)
+        } else {
+            return .double(number.doubleValue)
+        }
+    case let array as [Any]:
+        return .array(array.map { convertValueToAnyJSON($0) })
+    case let dict as [String: Any]:
+        return .object(dict.mapValues { convertValueToAnyJSON($0) })
+    case is NSNull:
+        return .null
+    default:
+        return .null
     }
 }

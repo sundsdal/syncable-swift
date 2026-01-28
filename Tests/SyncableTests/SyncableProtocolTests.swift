@@ -4,6 +4,7 @@ import GRDB
 @testable import Syncable
 
 /// Test model conforming to SyncableProtocol
+/// No CodingKeys needed - library handles snake_case conversion for Supabase
 struct TestItem: SyncableProtocol {
     var id: UUID
     var userId: UUID?
@@ -11,14 +12,6 @@ struct TestItem: SyncableProtocol {
     var deleted: Bool
     var syncedAt: Date?
     var title: String
-
-    // CodingKeys required for GRDB compatibility with snake_case schema
-    enum CodingKeys: String, CodingKey {
-        case id, deleted, title
-        case userId = "user_id"
-        case updatedAt = "updated_at"
-        case syncedAt = "synced_at"
-    }
 
     init(
         id: UUID = UUID(),
@@ -37,16 +30,16 @@ struct TestItem: SyncableProtocol {
     }
 }
 
-/// Create an in-memory database with the TestItem table (snake_case columns)
+/// Create an in-memory database with the TestItem table (camelCase columns)
 func makeTestDatabase() throws -> DatabaseQueue {
     let dbQueue = try DatabaseQueue()
     try dbQueue.write { db in
         try db.create(table: "testitems") { t in
             t.column("id", .text).primaryKey()
-            t.column("user_id", .text)
-            t.column("updated_at", .datetime).notNull()
+            t.column("userId", .text)
+            t.column("updatedAt", .datetime).notNull()
             t.column("deleted", .boolean).notNull().defaults(to: false)
-            t.column("synced_at", .datetime)
+            t.column("syncedAt", .datetime)
             t.column("title", .text).notNull()
         }
     }

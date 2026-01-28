@@ -35,7 +35,7 @@ public struct SyncableRegistration: Sendable {
     public static func create<T: SyncableProtocol>(_ type: T.Type) -> SyncableRegistration {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        // Note: No key conversion - models use CodingKeys for GRDB compatibility
+        decoder.keyDecodingStrategy = .convertFromSnakeCase  // Supabase snake_case → Swift camelCase
 
         return SyncableRegistration(
             tableName: T.databaseTableName,
@@ -96,15 +96,15 @@ public struct SyncableRegistration: Sendable {
                 guard let typedRecord = record as? T else {
                     throw SyncableRegistrationError.typeMismatch
                 }
-                // Encode to dictionary, remove synced_at (local-only), then re-encode
+                // Encode to dictionary, remove syncedAt (local-only), then re-encode
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601
-                // Note: No key conversion - models use CodingKeys for GRDB compatibility
+                encoder.keyEncodingStrategy = .convertToSnakeCase  // Swift camelCase → Supabase snake_case
                 let data = try encoder.encode(typedRecord)
                 guard var dict = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     throw SyncableRegistrationError.encodingFailed
                 }
-                // Remove local-only field before sending to backend (snake_case from CodingKeys)
+                // Remove local-only field before sending to backend (snake_case after conversion)
                 dict.removeValue(forKey: "synced_at")
                 return try JSONSerialization.data(withJSONObject: dict)
             },

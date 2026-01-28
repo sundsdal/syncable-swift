@@ -7,6 +7,7 @@ import GRDB
 /// The protocol ensures models have the necessary fields for conflict resolution and soft deletion.
 ///
 /// ## Usage
+/// Just define your model with standard Swift camelCase properties - no CodingKeys needed:
 /// ```swift
 /// struct Todo: SyncableProtocol {
 ///     var id: UUID
@@ -15,27 +16,31 @@ import GRDB
 ///     var deleted: Bool
 ///     var syncedAt: Date?  // Local-only, tracks last successful sync
 ///     var title: String
-///
-///     // CodingKeys map Swift camelCase to PostgreSQL snake_case
-///     enum CodingKeys: String, CodingKey {
-///         case id, deleted, title
-///         case userId = "user_id"
-///         case updatedAt = "updated_at"
-///         case syncedAt = "synced_at"
-///     }
 /// }
 /// ```
 ///
-/// ## Why CodingKeys Are Required
-/// GRDB uses Swift's `Codable` for database operations. Since your SQLite schema uses
-/// snake_case columns (to match Supabase), you need `CodingKeys` to map between:
-/// - Swift properties: `userId`, `updatedAt`, `syncedAt`
-/// - Database columns: `user_id`, `updated_at`, `synced_at`
+/// ## Automatic snake_case Conversion
+/// The library automatically converts between Swift camelCase and PostgreSQL snake_case
+/// when syncing with Supabase. You don't need to think about it:
+/// - Your Swift code uses `userId`, `updatedAt`
+/// - Your local SQLite uses `userId`, `updatedAt` (camelCase)
+/// - Supabase uses `user_id`, `updated_at` (snake_case) - handled by the library
 ///
-/// This mapping works for both GRDB (local SQLite) and Supabase (remote PostgreSQL).
+/// ## Local SQLite Schema (camelCase)
+/// Use standard Swift naming in your local database:
+/// ```swift
+/// try db.create(table: "todos") { t in
+///     t.column("id", .text).primaryKey()
+///     t.column("userId", .text)
+///     t.column("updatedAt", .datetime).notNull()
+///     t.column("deleted", .boolean).notNull()
+///     t.column("syncedAt", .datetime)  // Local-only
+///     t.column("title", .text).notNull()
+/// }
+/// ```
 ///
-/// ## Schema Setup
-/// Your Supabase table uses standard PostgreSQL snake_case:
+/// ## Supabase Schema (snake_case)
+/// Your Supabase table uses standard PostgreSQL conventions:
 /// ```sql
 /// CREATE TABLE todos (
 ///     id UUID PRIMARY KEY,
@@ -43,19 +48,8 @@ import GRDB
 ///     updated_at TIMESTAMPTZ NOT NULL,
 ///     deleted BOOLEAN NOT NULL DEFAULT false,
 ///     title TEXT NOT NULL
+///     -- Note: no synced_at column - it's local-only
 /// );
-/// ```
-///
-/// Your local SQLite schema should match:
-/// ```swift
-/// try db.create(table: "todos") { t in
-///     t.column("id", .text).primaryKey()
-///     t.column("user_id", .text)
-///     t.column("updated_at", .datetime).notNull()
-///     t.column("deleted", .boolean).notNull()
-///     t.column("synced_at", .datetime)  // Local-only
-///     // ...
-/// }
 /// ```
 ///
 /// ## Clock Skew Warning (V1 Limitation)
@@ -95,12 +89,13 @@ public extension SyncableProtocol {
     }
 }
 
-/// Column expressions for common Syncable fields (snake_case for PostgreSQL compatibility)
-/// Use these when building GRDB queries on Syncable types
+/// Column expressions for common Syncable fields.
+/// Use these when building GRDB queries on Syncable types.
+/// These match Swift property names - use camelCase in your SQLite schema.
 public enum SyncableColumns: String, ColumnExpression {
     case id
-    case userId = "user_id"
-    case updatedAt = "updated_at"
+    case userId
+    case updatedAt
     case deleted
-    case syncedAt = "synced_at"
+    case syncedAt
 }

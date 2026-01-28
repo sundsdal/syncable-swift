@@ -67,15 +67,6 @@ struct Todo: SyncableProtocol {
     var title: String
     var isCompleted: Bool
 
-    // MARK: - CodingKeys (REQUIRED: maps Swift camelCase to PostgreSQL snake_case)
-    enum CodingKeys: String, CodingKey {
-        case id, deleted, title
-        case userId = "user_id"
-        case updatedAt = "updated_at"
-        case syncedAt = "synced_at"
-        case isCompleted = "is_completed"
-    }
-
     // MARK: - Initialization
     init(
         id: UUID = UUID(),
@@ -97,18 +88,7 @@ struct Todo: SyncableProtocol {
 }
 ```
 
-#### Important: Column Naming Convention
-
-This library uses **snake_case** column names to match PostgreSQL/Supabase conventions:
-
-| Swift Property | Database Column | CodingKey |
-|----------------|-----------------|-----------|
-| `userId` | `user_id` | `case userId = "user_id"` |
-| `updatedAt` | `updated_at` | `case updatedAt = "updated_at"` |
-| `syncedAt` | `synced_at` | `case syncedAt = "synced_at"` |
-| `isCompleted` | `is_completed` | `case isCompleted = "is_completed"` |
-
-You **must** define `CodingKeys` with these mappings for sync to work correctly.
+**No `CodingKeys` needed!** The library automatically converts between Swift camelCase and PostgreSQL snake_case when syncing with Supabase.
 
 #### Understanding `syncedAt`
 
@@ -120,26 +100,28 @@ This per-record tracking is crash-resilient: if the app crashes mid-sync, unsync
 
 ### 2. Create the Local Database Table
 
-Create the SQLite table using GRDB. Column names must use snake_case:
+Create the SQLite table using GRDB with **camelCase** column names (matching your Swift properties):
 
 ```swift
 import GRDB
 
 func createTodosTable(in db: Database) throws {
     try db.create(table: "todos", ifNotExists: true) { t in
-        // Required Syncable columns (TEXT for UUIDs to match Supabase format)
+        // Required Syncable columns (TEXT for UUIDs)
         t.column("id", .text).primaryKey()
-        t.column("user_id", .text)
-        t.column("updated_at", .datetime).notNull()
+        t.column("userId", .text)
+        t.column("updatedAt", .datetime).notNull()
         t.column("deleted", .boolean).notNull().defaults(to: false)
-        t.column("synced_at", .datetime)  // Local-only, NOT in Supabase
+        t.column("syncedAt", .datetime)  // Local-only, NOT in Supabase
 
         // Your custom columns
         t.column("title", .text).notNull()
-        t.column("is_completed", .boolean).notNull().defaults(to: false)
+        t.column("isCompleted", .boolean).notNull().defaults(to: false)
     }
 }
 ```
+
+The library handles the conversion to snake_case (`user_id`, `updated_at`, etc.) when syncing with Supabase.
 
 ### 3. Set Up the Supabase Backend
 
@@ -170,14 +152,16 @@ $$ LANGUAGE plpgsql;
 
 #### 3.3 Create Your Table
 
+Supabase uses PostgreSQL conventions (snake_case). The library automatically converts between your camelCase Swift code and Supabase's snake_case:
+
 ```sql
 CREATE TABLE todos (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    user_id UUID NOT NULL,          -- Maps to Swift: userId
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),  -- Maps to Swift: updatedAt
     deleted BOOLEAN NOT NULL DEFAULT false,
     title TEXT NOT NULL,
-    is_completed BOOLEAN NOT NULL DEFAULT false
+    is_completed BOOLEAN NOT NULL DEFAULT false  -- Maps to Swift: isCompleted
 );
 
 -- Indexes for efficient queries

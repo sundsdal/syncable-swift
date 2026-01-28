@@ -11,7 +11,7 @@ struct EchoPreventionCacheTests {
 
     @Test("Marks IDs as recently pushed")
     func marksIdsAsPushed() {
-        var cache = EchoPreventionCache(ttl: 60.0)
+        let cache = EchoPreventionCache(ttl: 60.0)
         let id = UUID()
 
         #expect(!cache.wasRecentlyPushed(id))
@@ -29,7 +29,7 @@ struct EchoPreventionCacheTests {
 
     @Test("IDs expire after TTL")
     func idsExpireAfterTTL() {
-        var cache = EchoPreventionCache(ttl: 0.1)
+        let cache = EchoPreventionCache(ttl: 0.1)
         let id = UUID()
 
         cache.markAsPushed(id)
@@ -39,18 +39,18 @@ struct EchoPreventionCacheTests {
         #expect(!cache.wasRecentlyPushed(id))
     }
 
-    @Test("purgeExpired removes old entries")
+    @Test("purgeExpired removes old entries lazily on write")
     func purgeRemovesExpired() {
-        var cache = EchoPreventionCache(ttl: 0.1)
+        let cache = EchoPreventionCache(ttl: 0.1)
         let id1 = UUID()
         let id2 = UUID()
 
         cache.markAsPushed(id1)
         Thread.sleep(forTimeInterval: 0.15)
+        // markAsPushed now calls purgeExpired lazily, so id1 is removed when id2 is added
         cache.markAsPushed(id2)
 
-        #expect(cache.count == 2)
-        cache.purgeExpired()
+        // Lazy purge already happened during markAsPushed(id2), so only id2 remains
         #expect(cache.count == 1)
         #expect(!cache.wasRecentlyPushed(id1))
         #expect(cache.wasRecentlyPushed(id2))
@@ -58,7 +58,7 @@ struct EchoPreventionCacheTests {
 
     @Test("Multiple IDs tracked independently")
     func multipleIdsTracked() {
-        var cache = EchoPreventionCache(ttl: 60.0)
+        let cache = EchoPreventionCache(ttl: 60.0)
         let ids = (0..<5).map { _ in UUID() }
 
         for id in ids {
@@ -75,7 +75,7 @@ struct EchoPreventionCacheTests {
 
     @Test("clear removes all entries")
     func clearRemovesAll() {
-        var cache = EchoPreventionCache(ttl: 60.0)
+        let cache = EchoPreventionCache(ttl: 60.0)
         let ids = (0..<5).map { _ in UUID() }
 
         for id in ids {
@@ -182,7 +182,7 @@ struct SyncManagerRealtimeTests {
         await manager.stopRealtime()
     }
 
-    @Test("startRealtime without userId does nothing")
+    @Test("startRealtime without userId throws error")
     func startRealtimeWithoutUserId() async throws {
         let dbQueue = try DatabaseQueue()
         let supabase = SupabaseClient(
@@ -199,10 +199,19 @@ struct SyncManagerRealtimeTests {
 
         manager.register(TestItem.self)
 
-        // Should not crash, just return early
-        try await manager.startRealtime()
+        // Should throw SyncError.userIdNotSet
+        do {
+            try await manager.startRealtime()
+            Issue.record("Expected startRealtime to throw userIdNotSet error")
+        } catch let error as SyncError {
+            if case .userIdNotSet = error {
+                // Expected error
+            } else {
+                Issue.record("Expected userIdNotSet error, got \(error)")
+            }
+        }
 
-        // Stop should also be safe
+        // Stop should still be safe
         await manager.stopRealtime()
     }
 

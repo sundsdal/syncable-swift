@@ -349,6 +349,12 @@ struct SyncErrorTests {
         #expect(error.localizedDescription.contains("decode"))
         #expect(error.localizedDescription.contains("Missing field"))
     }
+
+    @Test("userIdNotSet has descriptive message")
+    func userIdNotSetMessage() {
+        let error = SyncError.userIdNotSet
+        #expect(error.localizedDescription.contains("userId"))
+    }
 }
 
 // MARK: - Mock Supabase Client

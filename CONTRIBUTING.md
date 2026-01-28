@@ -2,13 +2,13 @@
 
 ## Development Environment
 
-We use standard Swift tooling. If you have `just` installed, you can use the provided recipes.
+We use standard Swift Package Manager tooling.
 
 ### Common Tasks
 
-- **Build**: `just build` (or `swift build`)
-- **Test**: `just test` (or `swift test`)
-- **Clean**: `just clean` (or `swift package clean`)
+- **Build**: `swift build`
+- **Test**: `swift test`
+- **Clean**: `swift package clean`
 
 ## Code Generation vs. Swift
 

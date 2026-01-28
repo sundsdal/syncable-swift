@@ -6,9 +6,14 @@ import Foundation
 /// of the change. Without echo prevention, we would pull the same record back
 /// immediately, wasting bandwidth and potentially causing sync loops.
 ///
+/// ## Thread Safety
+/// This is a reference type (class) to ensure mutations persist when used within
+/// lock-protected code blocks. Struct value semantics would cause mutations to
+/// only affect copies, breaking echo prevention.
+///
 /// ## Usage
 /// ```swift
-/// var cache = EchoPreventionCache(ttl: 60.0)
+/// let cache = EchoPreventionCache(ttl: 60.0)
 ///
 /// // After pushing a record
 /// cache.markAsPushed(record.id)
@@ -20,7 +25,7 @@ import Foundation
 /// }
 /// // Pull the change
 /// ```
-public struct EchoPreventionCache: Sendable {
+public final class EchoPreventionCache: @unchecked Sendable {
     private var cache: [UUID: Date] = [:]
 
     /// Time-to-live for cached entries in seconds
@@ -37,7 +42,10 @@ public struct EchoPreventionCache: Sendable {
 
     /// Mark a record ID as recently pushed to Supabase
     /// - Parameter id: The record's ID
-    public mutating func markAsPushed(_ id: UUID) {
+    ///
+    /// Also purges expired entries lazily to prevent unbounded cache growth.
+    public func markAsPushed(_ id: UUID) {
+        purgeExpired()
         cache[id] = Date()
     }
 
@@ -50,13 +58,13 @@ public struct EchoPreventionCache: Sendable {
     }
 
     /// Remove expired entries from the cache
-    public mutating func purgeExpired() {
+    public func purgeExpired() {
         let cutoff = Date().addingTimeInterval(-ttl)
         cache = cache.filter { $0.value > cutoff }
     }
 
     /// Clear all entries from the cache
-    public mutating func clear() {
+    public func clear() {
         cache.removeAll()
     }
 }

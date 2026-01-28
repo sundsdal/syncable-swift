@@ -71,7 +71,7 @@ public final class SyncManager: @unchecked Sendable {
     // MARK: - Realtime State (protected by lock)
 
     private var realtimeManager: RealtimeSubscriptionManager?
-    private var _echoCache = EchoPreventionCache()
+    private let _echoCache = EchoPreventionCache()  // Reference type, safe to use under lock
 
     // MARK: - Statistics (protected by lock)
 
@@ -100,6 +100,18 @@ public final class SyncManager: @unchecked Sendable {
         self.supabaseClient = supabaseClient
         self.timestampStorage = timestampStorage
         self.maxRows = maxRows
+    }
+
+    deinit {
+        // Cancel any running tasks to prevent resource leaks
+        // Note: Cannot await stopRealtime() in deinit, but cancelling the task
+        // will trigger cleanup when the task next yields
+        lock.withLock {
+            syncLoopTask?.cancel()
+            syncLoopTask = nil
+            networkMonitor?.stop()
+            networkMonitor = nil
+        }
     }
 
     // MARK: - Thread-safe property access
@@ -245,8 +257,14 @@ public final class SyncManager: @unchecked Sendable {
     /// recently pushed changes are not pulled back unnecessarily.
     ///
     /// - Note: Requires `userId` to be set. Call after `setUserId(_:)`.
+    /// - Throws: `SyncError.userIdNotSet` if userId is nil, or subscription errors.
     public func startRealtime() async throws {
-        guard let currentUserId = userId else { return }
+        guard let currentUserId = userId else {
+            throw SyncError.userIdNotSet
+        }
+
+        // Stop any existing manager first to ensure a clean state
+        await stopRealtime()
 
         let manager = RealtimeSubscriptionManager(
             supabase: supabaseClient,
@@ -256,13 +274,20 @@ public final class SyncManager: @unchecked Sendable {
             }
         )
 
-        // Subscribe to all registered tables
-        let tables = registeredTables
-        for table in tables {
-            try await manager.subscribe(to: table)
-        }
-
+        // Assign the manager immediately so stopRealtime() can clean up on failure
         lock.withLock { realtimeManager = manager }
+
+        do {
+            // Subscribe to all registered tables
+            let tables = registeredTables
+            for table in tables {
+                try await manager.subscribe(to: table)
+            }
+        } catch {
+            // On failure, clean up any partial subscriptions and rethrow
+            await stopRealtime()
+            throw error
+        }
     }
 
     /// Stop realtime subscriptions for all tables.
@@ -283,11 +308,20 @@ public final class SyncManager: @unchecked Sendable {
 
         // Pull changes for this table
         if let registration = lock.withLock({ registrations[tableName] }) {
-            try? await pull(registration: registration)
+            do {
+                try await pull(registration: registration)
 
-            // Notify listener of realtime change
-            let callback = lock.withLock { _onRealtimeChange }
-            callback?(tableName)
+                // Notify listener of realtime change
+                let callback = lock.withLock { _onRealtimeChange }
+                callback?(tableName)
+            } catch {
+                // Log error but don't propagate - realtime pulls are best-effort
+                // The next scheduled sync or manual sync will retry
+                #if DEBUG
+                print("[SyncManager] Realtime pull failed for \(tableName): \(error.localizedDescription)")
+                #endif
+                updateStatus(.failed(error))
+            }
         }
     }
 
@@ -400,9 +434,9 @@ public final class SyncManager: @unchecked Sendable {
         let lastPullKey = "lastPull_\(tableName)"
         let lastPullIdKey = "lastPullId_\(tableName)"
 
-        // Key-set pagination state
+        // Key-set pagination state (using consistent storage abstraction)
         let lastPulledTime = await timestampStorage.getLastSyncTimestamp(for: lastPullKey)
-        let lastPulledIdString = UserDefaults.standard.string(forKey: lastPullIdKey)
+        let lastPulledIdString = await timestampStorage.getCursorId(for: lastPullIdKey)
         let lastPulledId = lastPulledIdString.flatMap { UUID(uuidString: $0) }
 
         // Build query with key-set pagination to avoid missing records at timestamp boundaries
@@ -461,7 +495,7 @@ public final class SyncManager: @unchecked Sendable {
         // Update key-set pagination cursor
         if let lastItem {
             await timestampStorage.setLastSyncTimestamp(lastItem.updatedAt, for: lastPullKey)
-            UserDefaults.standard.set(lastItem.id.uuidString, forKey: lastPullIdKey)
+            await timestampStorage.setCursorId(lastItem.id.uuidString, for: lastPullIdKey)
         }
     }
 
@@ -511,24 +545,21 @@ public final class SyncManager: @unchecked Sendable {
 
     // MARK: - Utilities
 
-    /// Clear all sync timestamps (call when user logs out)
+    /// Clear all sync state (call when user logs out)
+    ///
+    /// This clears all timestamps, cursor IDs, and resets the manager state.
     public func clearSyncState() async {
         stopSyncLoop()
         await stopRealtime()
+        // clearAll() clears both timestamps and cursor IDs via the storage abstraction
         await timestampStorage.clearAll()
-
-        // Clear key-set pagination cursor IDs from UserDefaults
-        let tables = lock.withLock { Array(registrations.keys) }
-        for tableName in tables {
-            UserDefaults.standard.removeObject(forKey: "lastPullId_\(tableName)")
-        }
 
         lock.withLock {
             _userId = nil
             _syncingEnabled = false
             _syncStatus = .idle
             _lastSyncTime = nil
-            _echoCache = EchoPreventionCache()
+            _echoCache.clear()
             _nSyncedToBackend = 0
             _nSyncedFromBackend = 0
         }
@@ -566,6 +597,7 @@ public enum SyncError: Error, LocalizedError {
     case encodingFailed(String)
     case decodingFailed(String)
     case networkError(Error)
+    case userIdNotSet
 
     public var errorDescription: String? {
         switch self {
@@ -577,6 +609,8 @@ public enum SyncError: Error, LocalizedError {
             return "Failed to decode from sync: \(message)"
         case .networkError(let error):
             return "Network error during sync: \(error.localizedDescription)"
+        case .userIdNotSet:
+            return "userId must be set before calling this method"
         }
     }
 }

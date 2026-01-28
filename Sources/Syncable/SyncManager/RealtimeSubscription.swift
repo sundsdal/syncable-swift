@@ -110,20 +110,29 @@ public actor RealtimeSubscriptionManager {
     }
 
     /// Unsubscribe from all tables
+    ///
+    /// Captures state before suspending to prevent reentrancy issues where
+    /// a concurrent `subscribe(to:)` call could add a new channel that gets
+    /// wiped without being properly unsubscribed.
     public func unsubscribeAll() async {
-        // Cancel all listener tasks
-        for (_, tasks) in listenerTasks {
+        // Capture and clear state BEFORE any suspension points
+        // This ensures concurrent subscribe() calls don't get lost
+        let currentTasks = listenerTasks
+        let currentChannels = channels.values
+        listenerTasks.removeAll()
+        channels.removeAll()
+
+        // Cancel all listener tasks (no suspension)
+        for (_, tasks) in currentTasks {
             for task in tasks {
                 task.cancel()
             }
         }
-        listenerTasks.removeAll()
 
-        // Unsubscribe from all channels
-        for (_, channel) in channels {
+        // Unsubscribe from captured channels (suspends, but state is already cleared)
+        for channel in currentChannels {
             await channel.unsubscribe()
         }
-        channels.removeAll()
     }
 
     /// Get the list of currently subscribed table names

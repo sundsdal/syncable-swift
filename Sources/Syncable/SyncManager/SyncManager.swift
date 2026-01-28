@@ -72,6 +72,8 @@ public final class SyncManager: @unchecked Sendable {
 
     private var realtimeManager: RealtimeSubscriptionManager?
     private let _echoCache = EchoPreventionCache()  // Reference type, safe to use under lock
+    /// Tracks in-progress pulls per table to prevent concurrent cursor updates
+    private var _pullInProgress: Set<String> = []
 
     // MARK: - Statistics (protected by lock)
 
@@ -104,13 +106,22 @@ public final class SyncManager: @unchecked Sendable {
 
     deinit {
         // Cancel any running tasks to prevent resource leaks
-        // Note: Cannot await stopRealtime() in deinit, but cancelling the task
-        // will trigger cleanup when the task next yields
         lock.withLock {
             syncLoopTask?.cancel()
             syncLoopTask = nil
             networkMonitor?.stop()
             networkMonitor = nil
+        }
+
+        // Fire detached task to clean up realtime subscriptions
+        // Cannot await in deinit, but this ensures channels are properly closed
+        let manager = lock.withLock {
+            let m = realtimeManager
+            realtimeManager = nil
+            return m
+        }
+        if let manager {
+            Task.detached { await manager.unsubscribeAll() }
         }
     }
 
@@ -301,10 +312,29 @@ public final class SyncManager: @unchecked Sendable {
     }
 
     /// Handle a remote change notification from realtime subscription
+    ///
+    /// Pulls are serialized per table to prevent concurrent cursor updates from
+    /// regressing the pagination cursor. If a pull is already in progress for
+    /// this table, we skip - the in-progress pull will fetch all changes.
     private func handleRemoteChange(tableName: String, recordId: UUID) async {
         // Check echo cache - skip if we just pushed this record
         let wasEcho = lock.withLock { _echoCache.wasRecentlyPushed(recordId) }
         if wasEcho { return }
+
+        // Coalesce concurrent pulls: skip if one is already in progress for this table
+        let shouldPull = lock.withLock {
+            if _pullInProgress.contains(tableName) {
+                return false  // Pull already running, it will fetch this change
+            }
+            _pullInProgress.insert(tableName)
+            return true
+        }
+
+        guard shouldPull else { return }
+
+        defer {
+            lock.withLock { _ = _pullInProgress.remove(tableName) }
+        }
 
         // Pull changes for this table
         if let registration = lock.withLock({ registrations[tableName] }) {

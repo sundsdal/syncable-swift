@@ -103,20 +103,31 @@ struct SyncableDemo {
         print("  complete <n> - Mark todo #n as completed")
         print("  delete <n>   - Soft-delete todo #n")
         print("  sync         - Trigger manual sync")
-        print("  realtime     - Start realtime subscriptions")
-        print("  stop         - Stop realtime subscriptions")
+        print("  online       - Go online (start sync loop + realtime)")
+        print("  offline      - Go offline (stop sync loop + realtime)")
         print("  status       - Show sync status")
         print("  quit         - Exit the demo")
         print("=" .padding(toLength: 50, withPad: "=", startingAt: 0))
         print("")
 
+        // Start in online mode - sync loop handles automatic sync
+        print("🌐 Starting in ONLINE mode...")
+        syncManager.startSyncLoop(interval: 30)
+        do {
+            try await syncManager.startRealtime()
+            print("   ✓ Sync loop started (every 30s + on network reconnect)")
+            print("   ✓ Realtime subscriptions active")
+        } catch {
+            print("   ⚠️  Could not start realtime: \(error.localizedDescription)")
+        }
+
         // Initial sync
-        print("🔄 Performing initial sync...")
+        print("\n🔄 Performing initial sync...")
         do {
             try await syncManager.sync()
         } catch {
             print("   ⚠️  Initial sync failed: \(error.localizedDescription)")
-            print("   Continuing in offline mode...\n")
+            print("   Items will sync when connection is restored.\n")
         }
 
         // Show current todos
@@ -141,7 +152,7 @@ struct SyncableDemo {
                     continue
                 }
                 try await addTodo(db: dbQueue, userId: userId, title: title)
-                try await syncManager.sync()
+                // Sync loop will push automatically, or sync manually if offline
 
             case "list":
                 await listTodos(db: dbQueue, userId: userId)
@@ -152,7 +163,6 @@ struct SyncableDemo {
                     continue
                 }
                 try await completeTodo(db: dbQueue, userId: userId, index: index)
-                try await syncManager.sync()
 
             case "delete":
                 guard let arg = argument, let index = Int(arg) else {
@@ -160,20 +170,31 @@ struct SyncableDemo {
                     continue
                 }
                 try await deleteTodo(db: dbQueue, userId: userId, index: index)
-                try await syncManager.sync()
 
             case "sync":
                 print("🔄 Syncing...")
                 try await syncManager.sync()
 
-            case "realtime":
-                print("📡 Starting realtime subscriptions...")
-                try await syncManager.startRealtime()
-                print("   Listening for remote changes...")
+            case "online":
+                print("🌐 Going ONLINE...")
+                syncManager.startSyncLoop(interval: 30)
+                do {
+                    try await syncManager.startRealtime()
+                    print("   ✓ Sync loop started")
+                    print("   ✓ Realtime subscriptions active")
+                    print("   ✓ Syncing now...")
+                    try await syncManager.sync()
+                } catch {
+                    print("   ⚠️  Error: \(error.localizedDescription)")
+                }
 
-            case "stop":
-                print("📡 Stopping realtime subscriptions...")
+            case "offline":
+                print("📴 Going OFFLINE...")
+                syncManager.stopSyncLoop()
                 await syncManager.stopRealtime()
+                print("   ✓ Sync loop stopped")
+                print("   ✓ Realtime stopped")
+                print("   Items will be saved locally until you go online.")
 
             case "status":
                 print("📊 Status:")

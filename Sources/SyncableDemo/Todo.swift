@@ -3,6 +3,7 @@ import GRDB
 import Syncable
 
 /// A simple Todo model demonstrating SyncableProtocol conformance.
+/// No CodingKeys needed - the library handles camelCase ↔ snake_case conversion.
 struct Todo: SyncableProtocol {
     // MARK: - Required Syncable Fields
 
@@ -16,18 +17,6 @@ struct Todo: SyncableProtocol {
 
     var title: String
     var isCompleted: Bool
-
-    // MARK: - Coding Keys (maps Swift camelCase to PostgreSQL snake_case)
-
-    enum CodingKeys: String, CodingKey {
-        case id
-        case userId = "user_id"
-        case updatedAt = "updated_at"
-        case deleted
-        case syncedAt = "synced_at"
-        case title
-        case isCompleted = "is_completed"
-    }
 
     // MARK: - Initialization
 
@@ -53,16 +42,16 @@ struct Todo: SyncableProtocol {
 
     static var databaseTableName: String { "todos" }
 
-    // MARK: - GRDB Column Mapping (must match CodingKeys for consistency)
+    // MARK: - GRDB Column Mapping (camelCase to match local schema)
 
     enum Columns: String, ColumnExpression {
         case id
-        case userId = "user_id"
-        case updatedAt = "updated_at"
+        case userId
+        case updatedAt
         case deleted
-        case syncedAt = "synced_at"
+        case syncedAt
         case title
-        case isCompleted = "is_completed"
+        case isCompleted
     }
 }
 
@@ -70,19 +59,19 @@ struct Todo: SyncableProtocol {
 
 extension Todo {
     /// Create the todos table in the database (local GRDB schema)
-    /// Column names use snake_case to match Supabase/PostgreSQL convention
+    /// Column names use camelCase - the library converts to snake_case for Supabase
     static func createTable(in db: Database) throws {
         try db.create(table: databaseTableName, ifNotExists: true) { t in
-            // Syncable required columns (TEXT for UUIDs to match Supabase)
+            // Syncable required columns (TEXT for UUIDs)
             t.column("id", .text).primaryKey()
-            t.column("user_id", .text)
-            t.column("updated_at", .datetime).notNull()
+            t.column("userId", .text)
+            t.column("updatedAt", .datetime).notNull()
             t.column("deleted", .boolean).notNull().defaults(to: false)
-            t.column("synced_at", .datetime)  // Local-only, not in Supabase
+            t.column("syncedAt", .datetime)  // Local-only, not in Supabase
 
             // Custom columns
             t.column("title", .text).notNull()
-            t.column("is_completed", .boolean).notNull().defaults(to: false)
+            t.column("isCompleted", .boolean).notNull().defaults(to: false)
         }
     }
 }

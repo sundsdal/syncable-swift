@@ -59,6 +59,7 @@ public final class SyncManager: @unchecked Sendable {
     private var _syncStatus: SyncStatus = .idle
     private var _lastSyncTime: Date?
     private var _onStatusChange: ((SyncStatus) -> Void)?
+    private var _onRealtimeChange: ((String) -> Void)?  // Called with table name when realtime change pulled
 
     // MARK: - Sync Loop State (protected by lock)
 
@@ -136,6 +137,12 @@ public final class SyncManager: @unchecked Sendable {
     /// Register a callback to be notified of sync status changes
     public func onStatusChange(_ callback: @escaping (SyncStatus) -> Void) {
         lock.withLock { _onStatusChange = callback }
+    }
+
+    /// Register a callback to be notified when realtime changes are pulled
+    /// - Parameter callback: Called with the table name when changes are pulled via realtime
+    public func onRealtimeChange(_ callback: @escaping (String) -> Void) {
+        lock.withLock { _onRealtimeChange = callback }
     }
 
     private func updateStatus(_ status: SyncStatus) {
@@ -277,6 +284,10 @@ public final class SyncManager: @unchecked Sendable {
         // Pull changes for this table
         if let registration = lock.withLock({ registrations[tableName] }) {
             try? await pull(registration: registration)
+
+            // Notify listener of realtime change
+            let callback = lock.withLock { _onRealtimeChange }
+            callback?(tableName)
         }
     }
 

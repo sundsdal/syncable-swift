@@ -89,6 +89,13 @@ struct SyncableDemo {
             }
         }
 
+        // Set up realtime change callback
+        syncManager.onRealtimeChange { tableName in
+            print("\n   📡 Realtime: changes received for '\(tableName)' - run 'list' to see updates")
+            print("\n> ", terminator: "")
+            fflush(stdout)
+        }
+
         print("=" .padding(toLength: 50, withPad: "=", startingAt: 0))
         print("Interactive Commands:")
         print("  add <title>  - Add a new todo")

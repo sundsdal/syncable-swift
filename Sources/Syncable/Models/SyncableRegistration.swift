@@ -78,14 +78,17 @@ public struct SyncableRegistration: Sendable {
                 // LWW: Check if existing record and only update if incoming is newer
                 if let existing = try T.fetchOne(db, key: typedRecord.id) {
                     if typedRecord.updatedAt > existing.updatedAt {
-                        // Preserve local syncedAt when updating from remote
+                        // Item from server is newer - update and mark as synced
                         var updated = typedRecord
-                        updated.syncedAt = existing.syncedAt
+                        updated.syncedAt = typedRecord.updatedAt  // Mark as synced (came from server)
                         try updated.update(db)
                     }
                     // else: existing is newer, ignore incoming
                 } else {
-                    try typedRecord.insert(db)
+                    // New item from server - insert and mark as synced
+                    var newRecord = typedRecord
+                    newRecord.syncedAt = typedRecord.updatedAt  // Mark as synced (came from server)
+                    try newRecord.insert(db)
                 }
             },
             encode: { record in

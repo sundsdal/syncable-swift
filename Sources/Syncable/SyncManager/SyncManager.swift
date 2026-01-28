@@ -74,6 +74,8 @@ public final class SyncManager: @unchecked Sendable {
     private let _echoCache = EchoPreventionCache()  // Reference type, safe to use under lock
     /// Tracks in-progress pulls per table to prevent concurrent cursor updates
     private var _pullInProgress: Set<String> = []
+    /// Prevents concurrent full sync operations
+    private var _syncInProgress: Bool = false
 
     // MARK: - Statistics (protected by lock)
 
@@ -374,9 +376,25 @@ public final class SyncManager: @unchecked Sendable {
     // MARK: - Sync Operations
 
     /// Perform a full sync cycle (push then pull) for all registered types
+    ///
+    /// Sync operations are serialized - if a sync is already in progress,
+    /// this call will return immediately without doing anything.
+    /// This prevents concurrent syncs from causing cursor regression.
     public func sync() async throws {
         guard syncingEnabled else { return }
         guard userId != nil else { return }
+
+        // Prevent concurrent sync operations
+        let shouldSync = lock.withLock {
+            if _syncInProgress { return false }
+            _syncInProgress = true
+            return true
+        }
+        guard shouldSync else { return }
+
+        defer {
+            lock.withLock { _syncInProgress = false }
+        }
 
         updateStatus(.syncing)
 

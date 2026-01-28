@@ -18,8 +18,9 @@ public struct SyncableRegistration: Sendable {
     /// Fetch dirty records that need to be pushed (syncedAt is nil OR updatedAt > syncedAt)
     let fetchDirty: @Sendable (Database, UUID?, Int) throws -> [any SyncableProtocol]
 
-    /// Mark specific record IDs as synced (set syncedAt = updatedAt)
-    let markAsSynced: @Sendable ([UUID], Database) throws -> Void
+    /// Mark specific record IDs as synced (set syncedAt = pushedUpdatedAt)
+    /// Only updates records where updatedAt matches pushedUpdatedAt to prevent race conditions
+    let markAsSynced: @Sendable ([(id: UUID, pushedUpdatedAt: Date)], Database) throws -> Void
 
     /// Upsert a record into the database (LWW: only if newer)
     let upsertIfNewer: @Sendable (any SyncableProtocol, Database) throws -> Void
@@ -52,6 +53,7 @@ public struct SyncableRegistration: Sendable {
             },
             fetchDirty: { db, userId, limit in
                 // Dirty = syncedAt is NULL OR updatedAt > syncedAt
+                // Order by updatedAt, id for deterministic batching when over limit
                 var query = T.filter(
                     SyncableColumns.syncedAt == nil ||
                     SyncableColumns.updatedAt > SyncableColumns.syncedAt
@@ -59,15 +61,24 @@ public struct SyncableRegistration: Sendable {
                 if let userId {
                     query = query.filter(SyncableColumns.userId == userId)
                 }
-                return try query.limit(limit).fetchAll(db)
+                return try query
+                    .order(SyncableColumns.updatedAt.asc)
+                    .order(SyncableColumns.id.asc)
+                    .limit(limit)
+                    .fetchAll(db)
             },
-            markAsSynced: { ids, db in
-                guard !ids.isEmpty else { return }
-                // Update syncedAt = updatedAt for these specific IDs
-                for id in ids {
+            markAsSynced: { items, db in
+                guard !items.isEmpty else { return }
+                // Update syncedAt = pushedUpdatedAt only if updatedAt matches (prevents race condition)
+                // If a local edit happened after the push snapshot, updatedAt won't match and record stays dirty
+                for (id, pushedUpdatedAt) in items {
                     if var record = try T.fetchOne(db, key: id) {
-                        record.syncedAt = record.updatedAt
-                        try record.update(db)
+                        // Only mark as synced if the record hasn't been modified since we pushed it
+                        if record.updatedAt == pushedUpdatedAt {
+                            record.syncedAt = pushedUpdatedAt
+                            try record.update(db)
+                        }
+                        // else: record was modified after push, leave it dirty so it syncs again
                     }
                 }
             },

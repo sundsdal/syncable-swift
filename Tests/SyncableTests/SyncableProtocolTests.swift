@@ -273,9 +273,14 @@ struct SyncableRegistrationTests {
         let dbQueue = try makeTestDatabase()
         let registration = SyncableRegistration.create(TestItem.self)
 
-        let item = TestItem(updatedAt: Date(), syncedAt: nil, title: "Test")
+        var item = TestItem(updatedAt: Date(), syncedAt: nil, title: "Test")
         try dbQueue.write { db in
             try item.insert(db)
+        }
+
+        // Re-read the item to get the exact stored updatedAt (SQLite may have different precision)
+        let storedItem = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: item.id)!
         }
 
         // Verify item is dirty before
@@ -284,9 +289,9 @@ struct SyncableRegistrationTests {
         }
         #expect(dirtyBefore.count == 1)
 
-        // Mark as synced
+        // Mark as synced (passing the exact updatedAt from the database)
         try dbQueue.write { db in
-            try registration.markAsSynced([item.id], db)
+            try registration.markAsSynced([(id: storedItem.id, pushedUpdatedAt: storedItem.updatedAt)], db)
         }
 
         // Verify item is no longer dirty
@@ -300,6 +305,53 @@ struct SyncableRegistrationTests {
             try TestItem.fetchOne(db, key: item.id)
         }
         #expect(fetched?.syncedAt == fetched?.updatedAt)
+    }
+
+    @Test("Registration markAsSynced ignores modified records")
+    func markAsSyncedIgnoresModified() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+
+        // Create and insert item
+        let originalUpdatedAt = Date()
+        var item = TestItem(updatedAt: originalUpdatedAt, syncedAt: nil, title: "Test")
+        try dbQueue.write { db in
+            try item.insert(db)
+        }
+
+        // Get the exact stored updatedAt (simulating what push() captures)
+        let storedItem = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: item.id)!
+        }
+        let pushedUpdatedAt = storedItem.updatedAt
+
+        // Simulate a local edit that happens AFTER push captures the dirty items
+        // but BEFORE markAsSynced is called
+        try dbQueue.write { db in
+            var modified = try TestItem.fetchOne(db, key: item.id)!
+            modified.title = "Modified after push"
+            modified.updatedAt = Date().addingTimeInterval(1)  // Newer timestamp
+            try modified.update(db)
+        }
+
+        // Try to mark as synced with the OLD updatedAt
+        // This should NOT mark it as synced because updatedAt changed
+        try dbQueue.write { db in
+            try registration.markAsSynced([(id: item.id, pushedUpdatedAt: pushedUpdatedAt)], db)
+        }
+
+        // Verify item is still dirty (because it was modified after push)
+        let dirty = try dbQueue.read { db in
+            try registration.fetchDirty(db, nil, 100)
+        }
+        #expect(dirty.count == 1)
+
+        // Verify syncedAt is still nil (not marked as synced)
+        let fetched = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: item.id)
+        }
+        #expect(fetched?.syncedAt == nil)
+        #expect(fetched?.title == "Modified after push")
     }
 
     @Test("Registration upsertIfNewer applies LWW")

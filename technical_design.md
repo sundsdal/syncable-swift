@@ -62,32 +62,41 @@ struct Todo: SyncableProtocol {
     var userId: UUID?
     var updatedAt: Date
     var deleted: Bool
-    var syncedAt: Date?  // Local-only
+    var syncedAt: Date?  // Local-only: tracks sync state
     var title: String
     var isCompleted: Bool
-
-    // CodingKeys for snake_case (PostgreSQL convention)
-    enum CodingKeys: String, CodingKey {
-        case id, deleted, title
-        case userId = "user_id"
-        case updatedAt = "updated_at"
-        case syncedAt = "synced_at"
-        case isCompleted = "is_completed"
-    }
 
     // Optional: custom table name (default derived from type name)
     // static var databaseTableName: String { "todos" }
 }
 ```
 
+**No CodingKeys Required:** The library automatically converts between Swift camelCase (`userId`, `updatedAt`) and PostgreSQL snake_case (`user_id`, `updated_at`) when communicating with Supabase. Your local SQLite schema should use camelCase to match Swift property names.
+
+**Local SQLite Schema (camelCase):**
+
+```swift
+try db.create(table: "todos") { t in
+    t.column("id", .text).primaryKey()
+    t.column("userId", .text)
+    t.column("updatedAt", .datetime).notNull()
+    t.column("deleted", .boolean).notNull().defaults(to: false)
+    t.column("syncedAt", .datetime)  // Local-only, NOT in Supabase
+    t.column("title", .text).notNull()
+    t.column("isCompleted", .boolean).notNull().defaults(to: false)
+}
+```
+
 ### 2. SyncTimestampStorage Protocol
 
-Interface for persisting sync timestamps across app restarts:
+Interface for persisting sync state across app restarts:
 
 ```swift
 public protocol SyncTimestampStorage: Sendable {
-    func getLastSyncTimestamp(for tableName: String) async -> Date?
-    func setLastSyncTimestamp(_ timestamp: Date, for tableName: String) async
+    func getLastSyncTimestamp(for key: String) async -> Date?
+    func setLastSyncTimestamp(_ timestamp: Date, for key: String) async
+    func getCursorId(for key: String) async -> String?
+    func setCursorId(_ cursorId: String?, for key: String) async
     func clearAll() async
 }
 ```
@@ -106,7 +115,7 @@ public struct SyncableRegistration: Sendable {
     let decode: @Sendable (Data) throws -> any SyncableProtocol
     let fetchAll: @Sendable (Database, UUID?) throws -> [any SyncableProtocol]
     let fetchDirty: @Sendable (Database, UUID?, Int) throws -> [any SyncableProtocol]
-    let markAsSynced: @Sendable ([UUID], Database) throws -> Void
+    let markAsSynced: @Sendable ([(id: UUID, pushedUpdatedAt: Date)], Database) throws -> Void
     let upsertIfNewer: @Sendable (any SyncableProtocol, Database) throws -> Void
     let encode: @Sendable (any SyncableProtocol) throws -> Data
     let assignUserIdToOrphans: @Sendable (UUID, Database) throws -> Int
@@ -117,7 +126,7 @@ public struct SyncableRegistration: Sendable {
 
 **Key operations:**
 - `fetchDirty`: Finds records where `syncedAt IS NULL OR updatedAt > syncedAt`
-- `markAsSynced`: Sets `syncedAt = updatedAt` for successfully pushed records
+- `markAsSynced`: Sets `syncedAt = pushedUpdatedAt` only if `updatedAt` matches (prevents race condition if record was modified between fetch and mark)
 - `upsertIfNewer`: Applies LWW conflict resolution on pull
 - `assignUserIdToOrphans`: Claims anonymous records when user signs in
 
@@ -175,10 +184,11 @@ private func push(registration: SyncableRegistration) async throws {
         .upsert(jsonArray)
         .execute()
 
-    // Mark successfully pushed items as synced (sets syncedAt = updatedAt)
-    let syncedIds = dirtyItems.map(\.id)
+    // Mark successfully pushed items as synced
+    // Only marks records where updatedAt matches what we pushed (prevents race condition)
+    let syncedItems = dirtyItems.map { (id: $0.id, pushedUpdatedAt: $0.updatedAt) }
     try await dbWriter.write { db in
-        try registration.markAsSynced(syncedIds, db)
+        try registration.markAsSynced(syncedItems, db)
     }
 }
 ```

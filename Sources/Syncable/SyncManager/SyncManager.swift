@@ -317,14 +317,19 @@ public final class SyncManager: @unchecked Sendable {
     ///
     /// Pulls are serialized per table to prevent concurrent cursor updates from
     /// regressing the pagination cursor. If a pull is already in progress for
-    /// this table, we skip - the in-progress pull will fetch all changes.
+    /// this table (or a full sync is running), we skip - the in-progress operation
+    /// will fetch all changes.
     private func handleRemoteChange(tableName: String, recordId: UUID) async {
         // Check echo cache - skip if we just pushed this record
         let wasEcho = lock.withLock { _echoCache.wasRecentlyPushed(recordId) }
         if wasEcho { return }
 
-        // Coalesce concurrent pulls: skip if one is already in progress for this table
+        // Coalesce concurrent pulls: skip if a full sync or table pull is already in progress
         let shouldPull = lock.withLock {
+            // Skip if a full sync is running - it will pull all tables anyway
+            if _syncInProgress {
+                return false
+            }
             if _pullInProgress.contains(tableName) {
                 return false  // Pull already running, it will fetch this change
             }
@@ -461,17 +466,19 @@ public final class SyncManager: @unchecked Sendable {
             .execute()
 
         // Mark successfully synced items (per-row tracking prevents data loss)
-        let syncedIds = dirtyItems.map(\.id)
+        // Pass both ID and updatedAt to prevent race condition: if record was modified
+        // after we fetched dirty items, the updatedAt won't match and it stays dirty
+        let syncedItems = dirtyItems.map { (id: $0.id, pushedUpdatedAt: $0.updatedAt) }
         try await dbWriter.write { db in
-            try registration.markAsSynced(syncedIds, db)
+            try registration.markAsSynced(syncedItems, db)
         }
 
         // Mark pushed IDs in echo cache and update statistics
         lock.withLock {
-            for id in syncedIds {
+            for (id, _) in syncedItems {
                 _echoCache.markAsPushed(id)
             }
-            _nSyncedToBackend += syncedIds.count
+            _nSyncedToBackend += syncedItems.count
         }
     }
 

@@ -27,6 +27,10 @@ public struct SyncableRegistration: Sendable {
     /// Encode a record to JSON data for Supabase upload (excludes syncedAt)
     let encode: @Sendable (any SyncableProtocol) throws -> Data
 
+    /// Assign userId to orphaned records (where userId is nil) and mark them dirty for sync
+    /// Returns the count of records updated
+    let assignUserIdToOrphans: @Sendable (UUID, Database) throws -> Int
+
     /// Create a registration for a specific Syncable type
     public static func create<T: SyncableProtocol>(_ type: T.Type) -> SyncableRegistration {
         let decoder = JSONDecoder()
@@ -98,6 +102,20 @@ public struct SyncableRegistration: Sendable {
                 // Remove local-only field before sending to backend (snake_case from CodingKeys)
                 dict.removeValue(forKey: "synced_at")
                 return try JSONSerialization.data(withJSONObject: dict)
+            },
+            assignUserIdToOrphans: { userId, db in
+                // Find all records where userId is nil (created while anonymous)
+                let orphans = try T.filter(SyncableColumns.userId == nil).fetchAll(db)
+                var count = 0
+                let now = Date()
+                for var orphan in orphans {
+                    orphan.userId = userId
+                    orphan.updatedAt = now  // Mark as modified so it syncs
+                    orphan.syncedAt = nil   // Ensure it's dirty
+                    try orphan.update(db)
+                    count += 1
+                }
+                return count
             }
         )
     }

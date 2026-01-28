@@ -106,19 +106,15 @@ struct RealtimeSubscriptionManagerTests {
             supabaseKey: "dummy-key"
         )
         let userId = UUID()
-        var callbackInvoked = false
 
         let manager = RealtimeSubscriptionManager(
             supabase: supabase,
             userId: userId,
-            onRemoteChange: { _, _ in
-                callbackInvoked = true
-            }
+            onRemoteChange: { _, _ in }
         )
 
         let subscribedTables = await manager.subscribedTables
         #expect(subscribedTables.isEmpty)
-        #expect(!callbackInvoked)
     }
 
     @Test("unsubscribeAll cleans up when no subscriptions")

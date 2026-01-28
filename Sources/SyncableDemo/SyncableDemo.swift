@@ -198,13 +198,16 @@ struct SyncableDemo {
 
     static func listTodos(db: DatabaseQueue, userId: UUID) async {
         do {
-            let todos = try await db.read { db in
+            // Fetch todos for this user (UUID comparison in Swift, not string comparison in SQL)
+            let allTodos = try await db.read { db in
                 try Todo
-                    .filter(Todo.Columns.userId == userId.uuidString)
                     .filter(Todo.Columns.deleted == false)
                     .order(Todo.Columns.updatedAt.desc)
                     .fetchAll(db)
             }
+
+            // Filter by userId using UUID equality (avoids case sensitivity issues)
+            let todos = allTodos.filter { $0.userId == userId }
 
             if todos.isEmpty {
                 print("📋 No todos yet. Use 'add <title>' to create one.")
@@ -222,13 +225,13 @@ struct SyncableDemo {
     }
 
     static func completeTodo(db: DatabaseQueue, userId: UUID, index: Int) async throws {
-        let todos = try await db.read { db in
+        let allTodos = try await db.read { db in
             try Todo
-                .filter(Todo.Columns.userId == userId.uuidString)
                 .filter(Todo.Columns.deleted == false)
                 .order(Todo.Columns.updatedAt.desc)
                 .fetchAll(db)
         }
+        let todos = allTodos.filter { $0.userId == userId }
 
         guard index > 0, index <= todos.count else {
             print("   ✗ Invalid todo number")
@@ -246,13 +249,13 @@ struct SyncableDemo {
     }
 
     static func deleteTodo(db: DatabaseQueue, userId: UUID, index: Int) async throws {
-        let todos = try await db.read { db in
+        let allTodos = try await db.read { db in
             try Todo
-                .filter(Todo.Columns.userId == userId.uuidString)
                 .filter(Todo.Columns.deleted == false)
                 .order(Todo.Columns.updatedAt.desc)
                 .fetchAll(db)
         }
+        let todos = allTodos.filter { $0.userId == userId }
 
         guard index > 0, index <= todos.count else {
             print("   ✗ Invalid todo number")

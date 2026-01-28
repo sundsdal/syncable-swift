@@ -355,4 +355,73 @@ struct SyncableRegistrationTests {
         #expect(json?["title"] as? String == "Test")
         #expect(json?["synced_at"] == nil) // Should be excluded (snake_case)
     }
+
+    @Test("Registration assignUserIdToOrphans assigns userId to null records")
+    func assignUserIdToOrphans() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+        let newUserId = UUID()
+
+        // Create orphaned items (userId = nil)
+        let orphan1 = TestItem(userId: nil, title: "Orphan 1")
+        let orphan2 = TestItem(userId: nil, title: "Orphan 2")
+        // Create owned item (should not be modified)
+        let existingUserId = UUID()
+        let owned = TestItem(userId: existingUserId, title: "Owned")
+
+        try dbQueue.write { db in
+            try orphan1.insert(db)
+            try orphan2.insert(db)
+            try owned.insert(db)
+        }
+
+        // Assign userId to orphans
+        let count = try dbQueue.write { db in
+            try registration.assignUserIdToOrphans(newUserId, db)
+        }
+
+        #expect(count == 2)
+
+        // Verify orphans now have userId
+        let items = try dbQueue.read { db in
+            try TestItem.fetchAll(db)
+        }
+
+        let claimedOrphan1 = items.first { $0.id == orphan1.id }
+        let claimedOrphan2 = items.first { $0.id == orphan2.id }
+        let unchanged = items.first { $0.id == owned.id }
+
+        #expect(claimedOrphan1?.userId == newUserId)
+        #expect(claimedOrphan2?.userId == newUserId)
+        #expect(unchanged?.userId == existingUserId) // Should not be modified
+    }
+
+    @Test("Registration assignUserIdToOrphans marks records as dirty")
+    func assignUserIdToOrphansMarksDirty() throws {
+        let dbQueue = try makeTestDatabase()
+        let registration = SyncableRegistration.create(TestItem.self)
+
+        // Create orphan that was previously "synced"
+        let syncTime = Date().addingTimeInterval(-100)
+        let orphan = TestItem(userId: nil, updatedAt: syncTime, syncedAt: syncTime, title: "Orphan")
+
+        try dbQueue.write { db in
+            try orphan.insert(db)
+        }
+
+        // Assign userId
+        let newUserId = UUID()
+        _ = try dbQueue.write { db in
+            try registration.assignUserIdToOrphans(newUserId, db)
+        }
+
+        // Verify record is now dirty (syncedAt = nil, updatedAt updated)
+        let updated = try dbQueue.read { db in
+            try TestItem.fetchOne(db, key: orphan.id)
+        }
+
+        #expect(updated?.syncedAt == nil)
+        #expect(updated?.updatedAt ?? Date.distantPast > syncTime)
+        #expect(updated?.userId == newUserId)
+    }
 }

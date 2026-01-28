@@ -37,6 +37,7 @@ import Supabase
 /// All mutable state is protected by `lock`:
 /// - Core state: `_userId`, `_syncingEnabled`, `_syncStatus`, `_lastSyncTime`, `_onStatusChange`, `registrations`
 /// - Sync loop state: `_syncInterval`, `_backoff`, `syncLoopTask`, `networkMonitor`
+/// - Statistics: `_nSyncedToBackend`, `_nSyncedFromBackend`
 /// Maintainers must acquire `lock` before reading or writing any of these properties.
 public final class SyncManager: @unchecked Sendable {
     // MARK: - Dependencies
@@ -70,6 +71,11 @@ public final class SyncManager: @unchecked Sendable {
 
     private var realtimeManager: RealtimeSubscriptionManager?
     private var _echoCache = EchoPreventionCache()
+
+    // MARK: - Statistics (protected by lock)
+
+    private var _nSyncedToBackend: Int = 0
+    private var _nSyncedFromBackend: Int = 0
 
     // MARK: - Registrations
 
@@ -144,6 +150,26 @@ public final class SyncManager: @unchecked Sendable {
     public var syncInterval: TimeInterval {
         get { lock.withLock { _syncInterval } }
         set { lock.withLock { _syncInterval = newValue } }
+    }
+
+    // MARK: - Statistics
+
+    /// Total number of records pushed to backend since last reset
+    public var nSyncedToBackend: Int {
+        lock.withLock { _nSyncedToBackend }
+    }
+
+    /// Total number of records pulled from backend since last reset
+    public var nSyncedFromBackend: Int {
+        lock.withLock { _nSyncedFromBackend }
+    }
+
+    /// Reset sync statistics counters to zero
+    public func resetStatistics() {
+        lock.withLock {
+            _nSyncedToBackend = 0
+            _nSyncedFromBackend = 0
+        }
     }
 
     // MARK: - Sync Loop
@@ -347,11 +373,12 @@ public final class SyncManager: @unchecked Sendable {
             try registration.markAsSynced(syncedIds, db)
         }
 
-        // Mark pushed IDs in echo cache to prevent re-pulling our own changes
+        // Mark pushed IDs in echo cache and update statistics
         lock.withLock {
             for id in syncedIds {
                 _echoCache.markAsPushed(id)
             }
+            _nSyncedToBackend += syncedIds.count
         }
     }
 
@@ -415,11 +442,60 @@ public final class SyncManager: @unchecked Sendable {
             }
         }
 
+        // Update statistics
+        lock.withLock {
+            _nSyncedFromBackend += items.count
+        }
+
         // Update key-set pagination cursor
         if let lastItem {
             await timestampStorage.setLastSyncTimestamp(lastItem.updatedAt, for: lastPullKey)
             UserDefaults.standard.set(lastItem.id.uuidString, forKey: lastPullIdKey)
         }
+    }
+
+    // MARK: - Anonymous to Authenticated Flow
+
+    /// Assign the current userId to all orphaned records (where userId is nil).
+    ///
+    /// Call this after a user signs in to claim any data created while anonymous.
+    /// Orphaned records will be updated with the current userId and marked dirty for sync.
+    ///
+    /// ## Usage
+    /// ```swift
+    /// // User creates items while logged out (userId is nil in local DB)
+    /// let todo = Todo(id: UUID(), userId: nil, ...)
+    /// try db.write { try todo.insert($0) }
+    ///
+    /// // Later, user signs in
+    /// syncManager.setUserId(authenticatedUser.id)
+    /// let count = try await syncManager.fillMissingUserIdForLocalTables()
+    /// print("Claimed \(count) orphaned records")
+    ///
+    /// // Now sync to push the claimed records to backend
+    /// syncManager.setSyncingEnabled(true)
+    /// try await syncManager.sync()
+    /// ```
+    ///
+    /// - Returns: Total count of records that were assigned a userId
+    /// - Throws: Database errors if the update fails
+    @discardableResult
+    public func fillMissingUserIdForLocalTables() async throws -> Int {
+        guard let currentUserId = userId else {
+            return 0
+        }
+
+        let currentRegistrations = lock.withLock { registrations }
+
+        let totalCount = try await dbWriter.write { db -> Int in
+            var count = 0
+            for (_, registration) in currentRegistrations {
+                count += try registration.assignUserIdToOrphans(currentUserId, db)
+            }
+            return count
+        }
+
+        return totalCount
     }
 
     // MARK: - Utilities
@@ -442,6 +518,8 @@ public final class SyncManager: @unchecked Sendable {
             _syncStatus = .idle
             _lastSyncTime = nil
             _echoCache = EchoPreventionCache()
+            _nSyncedToBackend = 0
+            _nSyncedFromBackend = 0
         }
     }
 }

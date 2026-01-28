@@ -9,6 +9,7 @@ import Supabase
 /// - Pull: Supabase changes → Local (using LWW conflict resolution)
 /// - Registration of Syncable types
 /// - Timestamp tracking for incremental sync
+/// - Optional realtime subscriptions for instant sync on remote changes
 ///
 /// ## Usage
 /// ```swift
@@ -64,6 +65,11 @@ public final class SyncManager: @unchecked Sendable {
     private var _backoff = ExponentialBackoff()
     private var syncLoopTask: Task<Void, Never>?
     private var networkMonitor: NetworkMonitor?
+
+    // MARK: - Realtime State (protected by lock)
+
+    private var realtimeManager: RealtimeSubscriptionManager?
+    private var _echoCache = EchoPreventionCache()
 
     // MARK: - Registrations
 
@@ -197,6 +203,57 @@ public final class SyncManager: @unchecked Sendable {
         }
     }
 
+    // MARK: - Realtime Subscriptions
+
+    /// Start realtime subscriptions for all registered tables.
+    ///
+    /// When enabled, the SyncManager will receive instant notifications of remote
+    /// changes and automatically pull updates. Echo prevention ensures that
+    /// recently pushed changes are not pulled back unnecessarily.
+    ///
+    /// - Note: Requires `userId` to be set. Call after `setUserId(_:)`.
+    public func startRealtime() async throws {
+        guard let currentUserId = userId else { return }
+
+        let manager = RealtimeSubscriptionManager(
+            supabase: supabaseClient,
+            userId: currentUserId,
+            onRemoteChange: { [weak self] tableName, recordId in
+                await self?.handleRemoteChange(tableName: tableName, recordId: recordId)
+            }
+        )
+
+        // Subscribe to all registered tables
+        let tables = registeredTables
+        for table in tables {
+            try await manager.subscribe(to: table)
+        }
+
+        lock.withLock { realtimeManager = manager }
+    }
+
+    /// Stop realtime subscriptions for all tables.
+    public func stopRealtime() async {
+        let manager = lock.withLock {
+            let m = realtimeManager
+            realtimeManager = nil
+            return m
+        }
+        await manager?.unsubscribeAll()
+    }
+
+    /// Handle a remote change notification from realtime subscription
+    private func handleRemoteChange(tableName: String, recordId: UUID) async {
+        // Check echo cache - skip if we just pushed this record
+        let wasEcho = lock.withLock { _echoCache.wasRecentlyPushed(recordId) }
+        if wasEcho { return }
+
+        // Pull changes for this table
+        if let registration = lock.withLock({ registrations[tableName] }) {
+            try? await pull(registration: registration)
+        }
+    }
+
     // MARK: - Registration
 
     /// Register a Syncable type for synchronization
@@ -289,6 +346,13 @@ public final class SyncManager: @unchecked Sendable {
         try await dbWriter.write { db in
             try registration.markAsSynced(syncedIds, db)
         }
+
+        // Mark pushed IDs in echo cache to prevent re-pulling our own changes
+        lock.withLock {
+            for id in syncedIds {
+                _echoCache.markAsPushed(id)
+            }
+        }
     }
 
     private func pull(registration: SyncableRegistration) async throws {
@@ -363,6 +427,7 @@ public final class SyncManager: @unchecked Sendable {
     /// Clear all sync timestamps (call when user logs out)
     public func clearSyncState() async {
         stopSyncLoop()
+        await stopRealtime()
         await timestampStorage.clearAll()
 
         // Clear key-set pagination cursor IDs from UserDefaults
@@ -376,6 +441,7 @@ public final class SyncManager: @unchecked Sendable {
             _syncingEnabled = false
             _syncStatus = .idle
             _lastSyncTime = nil
+            _echoCache = EchoPreventionCache()
         }
     }
 }

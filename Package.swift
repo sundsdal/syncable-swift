@@ -35,7 +35,8 @@ let package = Package(
             dependencies: [
                 "Syncable",
                 .product(name: "Supabase", package: "supabase-swift")
-            ]
+            ],
+            exclude: ["supabase"]
         ),
         .testTarget(
             name: "SyncableTests",

@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 import GRDB
+import Supabase
 @testable import Syncable
 
 /// Test model conforming to SyncableProtocol
@@ -195,24 +196,31 @@ struct SyncableRegistrationTests {
         #expect(registration.tableName == "testitems")
     }
 
-    @Test("Registration can encode items")
+    @Test("Registration can encode items to AnyJSON")
     func registrationEncode() throws {
         let registration = SyncableRegistration.create(TestItem.self)
         let item = TestItem(title: "Encode Test")
 
-        let data = try registration.encode(item)
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let json = try registration.encodeToJSON(item)
 
-        #expect(json?["title"] as? String == "Encode Test")
+        guard case .object(let dict) = json else {
+            Issue.record("Expected object, got \(json)")
+            return
+        }
+        #expect(dict["title"] == .string("Encode Test"))
     }
 
-    @Test("Registration can decode items")
+    @Test("Registration can decode items from Supabase JSON")
     func registrationDecode() throws {
         let registration = SyncableRegistration.create(TestItem.self)
         let originalItem = TestItem(title: "Decode Test")
 
-        // Encode then decode
-        let data = try registration.encode(originalItem)
+        // Simulate Supabase response (snake_case JSON)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(originalItem)
+
         let decoded = try registration.decode(data) as? TestItem
 
         #expect(decoded?.id == originalItem.id)
@@ -389,16 +397,21 @@ struct SyncableRegistrationTests {
         #expect(finalResult?.title == "Newer") // Still "Newer", not "Older"
     }
 
-    @Test("Registration encode excludes synced_at")
+    @Test("Registration encodeToJSON excludes synced_at")
     func encodeExcludesSyncedAt() throws {
         let registration = SyncableRegistration.create(TestItem.self)
         let item = TestItem(syncedAt: Date(), title: "Test")
 
-        let data = try registration.encode(item)
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let json = try registration.encodeToJSON(item)
 
-        #expect(json?["title"] as? String == "Test")
-        #expect(json?["synced_at"] == nil) // Should be excluded (snake_case)
+        // Verify it's an object with expected fields
+        guard case .object(let dict) = json else {
+            Issue.record("Expected object, got \(json)")
+            return
+        }
+
+        #expect(dict["title"] == .string("Test"))
+        #expect(dict["synced_at"] == nil) // Should be excluded (snake_case)
     }
 
     @Test("Registration assignUserIdToOrphans assigns userId to null records")
